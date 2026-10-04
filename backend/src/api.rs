@@ -111,7 +111,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> ApiResult<Json<Value
         .fetch_all(&state.database)
         .await
         .map_err(db_error)?;
-    Ok(Json(json!({"projects": projects, "events": events, "skills": state.harness.skills.list().await.len()})))
+    Ok(Json(json!({"projects": projects, "events": events, "skills": state.harness.skills.len().await})))
 }
 
 #[derive(Deserialize)]
@@ -280,8 +280,23 @@ pub async fn project_memory(Path(project_id): Path<Uuid>, Query(query): Query<Me
     Ok(Json(json!({"embed_model": state.harness.embedder.model(), "items": items})))
 }
 
-pub async fn list_skills(State(state): State<SharedState>) -> Json<Value> {
-    Json(json!(state.harness.skills.list().await))
+#[derive(Deserialize)]
+pub struct SkillQuery {
+    q: Option<String>,
+}
+
+/// Library listing with outcome stats, or index search results for `?q=`.
+pub async fn list_skills(Query(query): Query<SkillQuery>, State(state): State<SharedState>) -> Json<Value> {
+    let stats: Vec<(String, i32, i32, i32, i32, i32)> = sqlx::query_as("SELECT skill, uses, accepted, revised, hits, misses FROM skill_stats").fetch_all(&state.database).await.unwrap_or_default();
+    let stats: HashMap<String, Value> = stats.into_iter().map(|(skill, uses, accepted, revised, hits, misses)| (skill, json!({"uses": uses, "accepted": accepted, "revised": revised, "hits": hits, "misses": misses}))).collect();
+    let mut skills = state.harness.skills.list().await;
+    if let Some(text) = query.q.as_deref().filter(|text| !text.trim().is_empty()) {
+        let ranked = state.harness.skills.search(text, 30).await;
+        let order: HashMap<&str, usize> = ranked.iter().enumerate().map(|(index, skill)| (skill.name.as_str(), index)).collect();
+        skills.retain(|skill| order.contains_key(skill.name.as_str()));
+        skills.sort_by_key(|skill| order[skill.name.as_str()]);
+    }
+    Json(json!(skills.into_iter().map(|skill| { let mut value = json!(skill); value["stats"] = stats.get(&skill.name).cloned().unwrap_or(Value::Null); value }).collect::<Vec<_>>()))
 }
 
 pub async fn get_skill(Path(name): Path<String>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
@@ -294,11 +309,27 @@ pub struct SaveSkill {
 }
 
 pub async fn save_skill(Path(name): Path<String>, State(state): State<SharedState>, Json(payload): Json<SaveSkill>) -> ApiResult<Json<Value>> {
-    state.harness.skills.save(&name, &payload.markdown).await.map(|skill| Json(json!(skill))).map_err(|error| (StatusCode::BAD_REQUEST, error))
+    state.harness.skills.save(&name, &payload.markdown, "local").await.map(|skill| Json(json!(skill))).map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+pub async fn delete_skill(Path(name): Path<String>, State(state): State<SharedState>) -> ApiResult<StatusCode> {
+    state.harness.skills.delete(&name).await.map(|_| StatusCode::NO_CONTENT).map_err(|error| (StatusCode::NOT_FOUND, error))
 }
 
 pub async fn reload_skills(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({"loaded": state.harness.skills.reload().await}))
+}
+
+#[derive(Deserialize)]
+pub struct ImportSkills {
+    source: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Imports SKILL.md files from a public GitHub repository into the local library.
+pub async fn import_skills(State(state): State<SharedState>, Json(payload): Json<ImportSkills>) -> ApiResult<Json<Value>> {
+    state.harness.skills.import_github(&state.harness.http, &payload.source, payload.overwrite).await.map(Json).map_err(|error| (StatusCode::BAD_REQUEST, error))
 }
 
 pub async fn get_settings(State(state): State<SharedState>) -> Json<Value> {
@@ -441,4 +472,50 @@ pub async fn add_watch(Path(project_id): Path<Uuid>, State(state): State<SharedS
 pub async fn delete_watch(Path(id): Path<Uuid>, State(state): State<SharedState>) -> ApiResult<StatusCode> {
     sqlx::query("DELETE FROM watchlist WHERE id = $1").bind(id).execute(&state.database).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct BacktestQuery {
+    symbol: String,
+    #[serde(default = "default_interval")]
+    interval: String,
+}
+
+fn default_interval() -> String {
+    "1h".into()
+}
+
+/// Proof before prediction: how the structure rules would have performed on history.
+pub async fn market_backtest(Query(query): Query<BacktestQuery>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    state.harness.quant.backtest(&query.symbol, &query.interval).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// Break → retest → continue analysis for the user's fixed-pip day-trade model.
+pub async fn market_retest(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    const ALLOWED: &[&str] = &["symbol", "interval", "level_interval", "pip", "sl_pips", "tp_pips", "max_wait", "k", "tol_pips", "spread_pips", "levels", "grid_entry"];
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| ALLOWED.contains(&key.as_str())).collect();
+    if !params.iter().any(|(key, _)| key == "symbol") {
+        return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
+    }
+    state.harness.quant.retest(&params).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// Top-down read for any instrument: consolidation or impulse per timeframe, failed wick sweeps and the playbook.
+pub async fn market_mtf(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    const ALLOWED: &[&str] = &["symbol", "intervals", "pip", "sl_pips", "tp_pips", "tp2_pips", "as_of"];
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| ALLOWED.contains(&key.as_str())).collect();
+    if !params.iter().any(|(key, _)| key == "symbol") {
+        return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
+    }
+    state.harness.quant.mtf(&params).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// Lines and reactions for any instrument: zones, touches, strength, odds and the multi-timeframe stack.
+pub async fn market_levels(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    const ALLOWED: &[&str] = &["symbol", "intervals", "pip", "as_of", "history_days"];
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| ALLOWED.contains(&key.as_str())).collect();
+    if !params.iter().any(|(key, _)| key == "symbol") {
+        return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
+    }
+    state.harness.quant.levels(&params).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
 }

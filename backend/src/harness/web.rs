@@ -14,7 +14,7 @@ use sqlx::PgPool;
 
 use super::{compress, ledger::sha256_hex};
 
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) GodViewResearch/0.2";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) ViewEngineResearch/0.3";
 const CACHE_HOURS: i32 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

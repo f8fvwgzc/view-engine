@@ -81,7 +81,7 @@ pub struct ProviderConfig {
 impl ProviderConfig {
     pub fn from_env() -> Self {
         let env = |key: &str| std::env::var(key).ok().filter(|value| !value.trim().is_empty());
-        let workdir = env("GODVIEW_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("godview-agents"));
+        let workdir = env("VIEW_ENGINE_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("view-engine-agents"));
         Self {
             claude_bin: env("CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             claude_model: env("CLAUDE_MODEL").or(Some("sonnet".into())),
@@ -126,6 +126,8 @@ pub struct LlmRequest {
     pub progress: Option<ProgressSink>,
     /// Images (chart screenshots) the model should look at.
     pub attachments: Vec<PathBuf>,
+    /// Reasoning effort for providers that support it (Claude `--effort`); None = the provider's default.
+    pub effort: Option<String>,
 }
 
 /// What an agent is doing right now, parsed from the provider's event stream.
@@ -291,6 +293,9 @@ async fn claude(config: &ProviderConfig, request: &LlmRequest) -> Result<LlmResp
     }
     if let Some(model) = request.model.as_ref().or(config.claude_model.as_ref()) {
         args.extend(["--model".into(), model.clone()]);
+    }
+    if let Some(effort) = &request.effort {
+        args.extend(["--effort".into(), effort.clone()]);
     }
     if let Some(schema) = &request.json_schema {
         args.extend(["--json-schema".into(), schema.to_string()]);

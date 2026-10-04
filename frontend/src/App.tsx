@@ -9,7 +9,7 @@ import { useLiveEvents } from './useLiveEvents'
 import { useUrlSelection } from './useUrlSelection'
 
 // Code-split the heavy parts: the graph (React Flow) and the modals load on first use.
-const GodView = lazy(() => import('./GodView').then((module) => ({ default: module.GodView })))
+const AgentGraph = lazy(() => import('./AgentGraph').then((module) => ({ default: module.AgentGraph })))
 const ProjectModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.ProjectModal })))
 const TaskModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.TaskModal })))
 const SettingsModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.SettingsModal })))
@@ -157,7 +157,7 @@ export function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">◉</span> GODVIEW <span>ENGINE</span></div>
+        <div className="brand"><span className="brand-mark">◉</span> VIEW <span>ENGINE</span></div>
         <div className="system-readout">
           <span>MODE <b>RESEARCH</b></span><i />
           <span>WORKING <b>{working}</b></span><i />
@@ -205,7 +205,7 @@ export function App() {
           <div className="workspace-title"><p className="eyebrow">{selectedProject?.name ?? 'NO PROJECT'}</p><h1>{selectedTask?.title ?? 'Select or create a research task'}</h1></div>
         </div>
         <div className="workspace-body">
-          <Suspense fallback={<div className="god-view"><div className="canvas-empty">Loading graph…</div></div>}><GodView detail={selectedTask ? detail : null} liveEvents={events} selectedAgent={selectedAgent} onSelectAgent={setSelectedAgent}
+          <Suspense fallback={<div className="agent-graph"><div className="canvas-empty">Loading graph…</div></div>}><AgentGraph detail={selectedTask ? detail : null} liveEvents={events} selectedAgent={selectedAgent} onSelectAgent={setSelectedAgent}
             emptyHint={selectedTask ? 'Start the research to watch the orchestrator hire its team.' : 'Select a task to watch its agents.'} /></Suspense>
           <div className="notification-stack" aria-live="polite">
             {notifications.map((notification) => <div className={`notification ${notification.kind}`} key={notification.id}>

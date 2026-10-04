@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::providers::{LlmResponse, Usage};
 
 /// Bump when prompts or compression change so stale cached answers are not reused.
-pub const CACHE_VERSION: &str = "godview-harness-v1";
+pub const CACHE_VERSION: &str = "view-engine-harness-v1";
 
 pub fn sha256_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))

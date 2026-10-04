@@ -10,7 +10,7 @@ import httpx
 import pandas as pd
 
 from .cache import TTL_CALENDAR, cache
-from .data import UA, DataError, iso
+from .data import UA, DataError, iso, now_utc, replay_as_of
 
 FEEDS = {
     "thisweek": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -115,7 +115,7 @@ def filter_events(events: Iterable[dict], now: datetime, currencies: Optional[se
 
 def get_calendar(currencies: Optional[list[str]] = None, impacts: Optional[list[str]] = None, days: float = 7,
                  past_hours: float = 24, now: Optional[datetime] = None) -> dict:
-    now = now or datetime.now(timezone.utc)
+    now = now or now_utc()
     cur = {c.strip().upper() for c in currencies or [] if c.strip()} or None
     imp = {i.strip().lower() for i in impacts or [] if i.strip()} or None
     raw, notes, fetched = [], [], []
@@ -140,6 +140,14 @@ def get_calendar(currencies: Optional[list[str]] = None, impacts: Optional[list[
         coverage = iso(max(times)) if times else None
         if times and max(times).to_pydatetime() < now + timedelta(days=days):
             notes.append(f"feed only covers events through {coverage}; later events unknown")
+    if replay_as_of() is not None:
+        first = min((pd.Timestamp(e["date"]).tz_convert("UTC") for e in raw if e.get("date")), default=None)
+        if first is None or pd.Timestamp(now) < first - pd.Timedelta(days=1):
+            evs = []
+            notes.append("replay: the free feed only holds the current week, so the calendar for this past date "
+                         "is UNAVAILABLE (not 'no events')")
+        else:
+            notes.append("replay: events are from the current weekly feed, timed relative to the replay timestamp")
     return {
         "source": SOURCE, "as_of": iso(min(fetched)) if fetched else iso(now), "now_utc": iso(now),
         "filters": {"currencies": sorted(cur) if cur else "all", "impact": sorted(imp) if imp else "all",

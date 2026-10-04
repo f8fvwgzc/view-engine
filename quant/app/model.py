@@ -17,7 +17,7 @@ import pandas as pd
 
 from . import indicators as ind
 from .cache import TTL_MODEL, cache
-from .data import bar_hours, get_series, iso, norm_interval
+from .data import bar_hours, get_series, iso, norm_interval, replay_key, submit_ctx
 from .symbols import REGISTRY, Symbol
 
 log = logging.getLogger("quant.model")
@@ -211,7 +211,7 @@ def _load_related(sym: Symbol, interval: str) -> dict[str, pd.Series]:
     def load(rid):
         return rid, get_series(REGISTRY[rid], interval).df["c"]
     with ThreadPoolExecutor(max_workers=5) as ex:
-        for fut in [ex.submit(load, r) for r in rel]:
+        for fut in [submit_ctx(ex, load, r) for r in rel]:
             try:
                 rid, s = fut.result()
                 out[rid] = s
@@ -262,7 +262,7 @@ def _train(sym: Symbol, interval: str, h: int) -> Trained | dict:
 
 def predict(sym: Symbol, interval: str = "1d", horizon: str | int | None = 1) -> dict:
     interval, h = parse_horizon(horizon, interval)
-    key = ("model", sym.id, interval, h, ENGINE)
+    key = ("model", sym.id, interval, h, ENGINE, replay_key())
     trained = cache.get_or_set(key, TTL_MODEL, lambda: _train(sym, interval, h))
     base = {"symbol": sym.id, "interval": interval, "horizon_bars": h,
             "horizon_hours": h * bar_hours(interval), "engine": ENGINE, "caveat": CAVEAT}
@@ -318,19 +318,27 @@ def _session_flags(ts) -> dict:
             "trans_code": {"Tokyo→London": 1, "London→New York": 2, "New York close": 3}.get(st["transition"], 0)}
 
 
+def boxes_for(ctx) -> list:
+    """box_at(df, t) for every bar (causal: uses bars <= t only); computed once per context."""
+    from .structure import bodies, box_at
+    bx = getattr(ctx, "_boxes", None)
+    if bx is None:
+        b = bodies(ctx.df)
+        bx = ctx._boxes = [box_at(ctx.df, t, _b=b) for t in range(len(ctx.df))]
+    return bx
+
+
 def structure_events(ctx) -> list[dict]:
     """All historical BOS + box-breakout events (causal) with entry/stop for labelling."""
-    from .structure import bodies, box_at
-    df = ctx.df
-    c = df["c"].to_numpy(float)
-    b = bodies(df)
+    c = ctx.df["c"].to_numpy(float)
+    boxes = boxes_for(ctx)
     evs = []
     for e in ctx.run.events:
         if e.type in ("bos_up", "bos_down"):
             evs.append({"t": e.idx, "type": e.type, "dir": 1 if e.type == "bos_up" else -1, "level": e.level,
                         "box": None})
-    for t in range(2, len(df)):
-        prior = box_at(df, t - 1, _b=b)
+    for t in range(2, len(c)):
+        prior = boxes[t - 1]
         if prior and (c[t] > prior["high"] or c[t] < prior["low"]):
             up = c[t] > prior["high"]
             evs.append({"t": t, "type": "box_breakout_up" if up else "box_breakout_down", "dir": 1 if up else -1,
@@ -341,11 +349,14 @@ def structure_events(ctx) -> list[dict]:
 
 def _protected(ctx, t: int, direction: int, entry: float):
     import bisect
+    # `history` = every swing as confirmed in real time. (The final `run.swings` list drops swings that were
+    # later replaced by a more extreme one, which would leak the future into historical stops.)
+    hist = ctx.run.history
     conf = getattr(ctx, "_conf", None)
     if conf is None:
-        conf = ctx._conf = [s.confirmed_idx for s in ctx.run.swings]
+        conf = ctx._conf = [s.confirmed_idx for s in hist]
     hi = bisect.bisect_right(conf, t)
-    for s in reversed(ctx.run.swings[:hi]):
+    for s in reversed(hist[:hi]):
         if direction > 0 and s.kind == "L" and s.price < entry:
             return s
         if direction < 0 and s.kind == "H" and s.price > entry:
@@ -453,7 +464,7 @@ def _train_structure(sym: Symbol, interval: str, k: int):
 
 
 def structure_model(sym: Symbol, interval: str = "1h", k: int = STRUCT_K) -> dict:
-    return cache.get_or_set(("struct_model", sym.id, interval, k, ENGINE), TTL_MODEL,
+    return cache.get_or_set(("struct_model", sym.id, interval, k, ENGINE, replay_key()), TTL_MODEL,
                             lambda: _train_structure(sym, interval, k))
 
 

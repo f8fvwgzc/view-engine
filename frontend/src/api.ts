@@ -1,4 +1,4 @@
-import type { WatchItem, Attachment, Dashboard, MarketSymbol, MemoryItem, PredictionBook, Project, Provider, Run, RunDetail, Settings, Skill, Task, TaskConfig } from './types'
+import type { Backtest, SkillImport, WatchItem, Attachment, Dashboard, MarketSymbol, MemoryItem, PredictionBook, Project, Provider, Run, RunDetail, Settings, Skill, Task, TaskConfig } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 
@@ -38,7 +38,13 @@ export const api = {
   run: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),
   cancelRun: (runId: string) => request<unknown>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
   memory: (projectId: string, q?: string) => request<{ embed_model: string; items: MemoryItem[] }>(`/api/projects/${projectId}/memory${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-  skills: () => request<Skill[]>('/api/skills'),
+  skills: (q?: string) => request<Skill[]>(`/api/skills${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  deleteSkill: (name: string) => request<void>(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  importSkills: (source: string, overwrite: boolean) => request<SkillImport>('/api/skills/import', { method: 'POST', body: JSON.stringify({ source, overwrite }) }),
+  retest: (symbol: string, pip: number, sl: number, tp: number) => request<{ markdown?: string; active?: { level: number; level_type: string; level_interval: string; status: string; break_direction?: string; distance_pips?: number }[]; notes?: string[] | string }>(`/api/market/retest?symbol=${encodeURIComponent(symbol)}&interval=15m&level_interval=1h&pip=${pip}&sl_pips=${sl}&tp_pips=${tp}`),
+  mtf: (symbol: string, pip: number, sl: number, tp: number) => request<{ markdown?: string }>(`/api/market/mtf?symbol=${encodeURIComponent(symbol)}&intervals=4h,1h,15m,5m&pip=${pip}&sl_pips=${sl}&tp_pips=${tp}&tp2_pips=${tp * 2}`),
+  levels: (symbol: string) => request<{ markdown?: string }>(`/api/market/levels?symbol=${encodeURIComponent(symbol)}&intervals=4h,1h,15m`),
+  backtest: (symbol: string, interval: string) => request<Backtest>(`/api/market/backtest?symbol=${encodeURIComponent(symbol)}&interval=${interval}`),
   skill: (name: string) => request<Skill>(`/api/skills/${encodeURIComponent(name)}`),
   saveSkill: (name: string, markdown: string) => request<Skill>(`/api/skills/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ markdown }) }),
   settings: () => request<Settings>('/api/settings'),

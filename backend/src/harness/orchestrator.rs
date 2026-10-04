@@ -38,6 +38,9 @@ const ORCHESTRATOR: &str = "orchestrator";
 const DEPENDENCY_CHARS: usize = 3_000;
 const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 const MAX_HIRE_DEPTH: usize = 2;
+/// Long-term memory is always on; these fixed token budgets bound how much of it enters a prompt.
+const MEMORY_PLAN_TOKENS: usize = 700;
+const MEMORY_AGENT_TOKENS: usize = 350;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RunAgent {
@@ -125,6 +128,8 @@ struct Trading {
     market: String,
     model_prob_up: Option<f64>,
     attachments: Vec<std::path::PathBuf>,
+    /// Replay mode: the desk analyses this past moment with no knowledge (and no web access) after it.
+    as_of: Option<DateTime<Utc>>,
 }
 
 impl RunContext {
@@ -167,7 +172,19 @@ async fn run_inner(state: SharedState, run_id: Uuid, cancelled: Arc<AtomicBool>)
     .fetch_one(&database)
     .await
     .map_err(|error| format!("run not found: {error}"))?;
-    let settings = RunSettings::load(&database, &task_config).await;
+    let mut settings = RunSettings::load(&database, &task_config).await;
+    // Day trading needs minutes, not tens of minutes: one pass per agent and no mid-run hiring.
+    let daytrade = task_config["style"].as_str() == Some("daytrade");
+    if daytrade {
+        settings.max_iterations = 1;
+        settings.allow_agent_hiring = false;
+        settings.max_rounds = 0;
+    }
+    let fast = daytrade && settings.depth == "quick";
+    // The fast path gets its facts precomputed by the sidecar; long deliberation only delays an intraday call.
+    if fast && settings.effort.is_none() {
+        settings.effort = Some("low".into());
+    }
     sqlx::query("UPDATE runs SET provider = $2, model = $3, config = $4 WHERE id = $1")
         .bind(run_id)
         .bind(settings.provider.as_str())
@@ -214,49 +231,70 @@ async fn run_inner(state: SharedState, run_id: Uuid, cancelled: Arc<AtomicBool>)
         .await;
 
     // Long-term memory: what the firm already knows about this project.
-    let memory_block = if ctx.settings.memory {
+    let memory_block = {
         let hits = memory::recall(&state.harness, project_id, &format!("{} {}", ctx.task_title, ctx.task_brief), 16).await;
         if !hits.is_empty() {
             ctx.event("memory_recalled", format!("Recalled {} memories from earlier research in this project.", hits.len())).from(ORCHESTRATOR).data(json!({"count": hits.len()})).publish(&state).await;
         }
-        memory::render_context(&hits, 700)
-    } else {
-        String::new()
+        memory::render_context(&hits, MEMORY_PLAN_TOKENS)
     };
 
     // Trading desk mode: live market data pack + chart screenshots, loaded before the team is hired.
     let desk_brief = prepare_trading(&ctx, &task_config).await;
 
-    // Hiring: the orchestrator plans the team against the skill catalog.
-    ctx.event("orchestrator_planning", "Analysing the request and designing the team…").from(ORCHESTRATOR).publish(&state).await;
-    let catalog = state.harness.skills.catalog().await;
-    let plan_request = LlmRequest {
-        provider: ctx.settings.provider,
-        model: None,
-        system: prompts::SYSTEM_CONSTITUTION.into(),
-        prompt: format!("{}{desk_brief}", prompts::plan_prompt(&ctx.project_name, &ctx.project_context, &ctx.task_title, &ctx.task_brief, if memory_block.is_empty() { "(nothing yet)" } else { &memory_block }, &catalog, ctx.settings.max_agents, &ctx.settings.depth)),
-        web: false,
-        timeout: Duration::from_secs(300),
-        json_schema: Some(prompts::plan_schema()),
-        progress: Some(progress_forwarder(&ctx, ORCHESTRATOR)),
-        attachments: ctx.trading.read().await.as_ref().map(|trading| trading.attachments.clone()).unwrap_or_default(),
-    };
-    let (plan_response, _) = state.harness.llm_routed(&plan_request, &router::resolve(&ctx.settings, "orchestrator"), ctx.site(Some(orchestrator.id), true)).await.map_err(|error| format!("orchestrator planning failed: {error}"))?;
-    let plan = plan_response.structured.or_else(|| extract_json(&plan_response.text)).ok_or("orchestrator returned no plan")?;
-    let decision = plan["decision_to_make"].as_str().unwrap_or(&ctx.task_title).to_string();
-    *ctx.decision.write().await = decision.clone();
-    let intent_text = render_intent(&plan);
-    *ctx.intent.write().await = intent_text.clone();
-    sqlx::query("UPDATE runs SET intent = $2, status = 'running' WHERE id = $1").bind(run_id).bind(json!({"decision_to_make": decision, "intent": plan["intent"], "rationale": plan["rationale"]})).execute(&database).await.map_err(|error| error.to_string())?;
-    sqlx::query("UPDATE run_agents SET output = $2, summary = $3 WHERE id = $1").bind(orchestrator.id).bind(&intent_text).bind(plan["rationale"].as_str()).execute(&database).await.map_err(|error| error.to_string())?;
-    ctx.event("orchestrator_decision", format!("Decision to make: {decision}")).from(ORCHESTRATOR).data(json!({"intent": plan["intent"], "rationale": plan["rationale"]})).publish(&state).await;
+    if fast {
+        // Fast path: no planning call. One head trader gets the whole data pack and the charts and answers directly.
+        let decision = format!("Day trade decision now: long, short or wait — {}", ctx.task_title);
+        *ctx.decision.write().await = decision.clone();
+        *ctx.intent.write().await = "Goal: an immediately executable intraday decision using the desk rules in the data pack.\nSuccess criteria:\n- direction or WAIT\n- the line, the trigger candle condition, entry, fixed stop and targets\n- the session window and the cancel condition".to_string();
+        sqlx::query("UPDATE runs SET intent = $2, status = 'running' WHERE id = $1").bind(run_id).bind(json!({"decision_to_make": decision, "rationale": "Fast day-trade path: single head trader, no planning step."})).execute(&database).await.map_err(|error| error.to_string())?;
+        ctx.event("orchestrator_decision", "Fast day-trade path: one head trader, no planning step.").from(ORCHESTRATOR).publish(&state).await;
+        let specs = validate_team(&ctx, vec![AgentSpec {
+            key: "head_trader".into(),
+            name: "Head Trader".into(),
+            role: "Reads the charts, the session story and the body-close lines; decides long, short or wait".into(),
+            kind: "strategist".into(),
+            objective: "Decide now, top-down. First state what H4, then H1, then M15/M5 are doing (consolidation box with its body top and bottom, or impulse with direction), each proven by specific candle closes or wicks. If the higher timeframes consolidate and price is inside the box, give a RANGE plan: sell zone at the top edge and buy zone at the bottom edge, each with stop, targets and the M15/M5 trigger. If a body has closed outside the box, give the break → retest plan. Otherwise long, short or WAIT with the line, trigger, entry, fixed stop and targets. Always say what must print for price to continue up and to continue down, the session window and the cancel condition. Then give the decision table: when to sell, when to buy, when to hold, each with its reason, plus the fakeout case, the news inside the horizon and the risks. If the user wrote their own prediction, test it against the closes. Be brief: at most 350 words before the JSON block.".into(),
+            skills: vec!["dow-structure-body-close".into(), "head-trader-trade-plan".into(), "chart-reading-technical".into()],
+            depends_on: vec![],
+            reports_to: Some(ORCHESTRATOR.into()),
+            max_iterations: Some(1),
+        }], &[ORCHESTRATOR.to_string()].into_iter().collect()).await;
+        hire_all(&ctx, &specs, 1, ORCHESTRATOR).await?;
+    } else {
+        // Hiring: the orchestrator plans the team against the skill catalog.
+        ctx.event("orchestrator_planning", "Analysing the request and designing the team…").from(ORCHESTRATOR).publish(&state).await;
+        // Only a shortlist of the library reaches the prompt, retrieved for this task by the skill index.
+        let catalog = state.harness.skills.catalog_for(&format!("{} {} {} {desk_brief}", ctx.project_name, ctx.task_title, ctx.task_brief), 40).await;
+        let plan_request = LlmRequest {
+            provider: ctx.settings.provider,
+            model: None,
+            system: prompts::SYSTEM_CONSTITUTION.into(),
+            prompt: format!("{}{desk_brief}", prompts::plan_prompt(&ctx.project_name, &ctx.project_context, &ctx.task_title, &ctx.task_brief, if memory_block.is_empty() { "(nothing yet)" } else { &memory_block }, &catalog, ctx.settings.max_agents, &ctx.settings.depth)),
+            web: false,
+            timeout: Duration::from_secs(300),
+            json_schema: Some(prompts::plan_schema()),
+            progress: Some(progress_forwarder(&ctx, ORCHESTRATOR)),
+            attachments: ctx.trading.read().await.as_ref().map(|trading| trading.attachments.clone()).unwrap_or_default(),
+            effort: None,
+        };
+        let (plan_response, _) = state.harness.llm_routed(&plan_request, &router::resolve(&ctx.settings, "orchestrator"), ctx.site(Some(orchestrator.id), true)).await.map_err(|error| format!("orchestrator planning failed: {error}"))?;
+        let plan = plan_response.structured.or_else(|| extract_json(&plan_response.text)).ok_or("orchestrator returned no plan")?;
+        let decision = plan["decision_to_make"].as_str().unwrap_or(&ctx.task_title).to_string();
+        *ctx.decision.write().await = decision.clone();
+        let intent_text = render_intent(&plan);
+        *ctx.intent.write().await = intent_text.clone();
+        sqlx::query("UPDATE runs SET intent = $2, status = 'running' WHERE id = $1").bind(run_id).bind(json!({"decision_to_make": decision, "intent": plan["intent"], "rationale": plan["rationale"]})).execute(&database).await.map_err(|error| error.to_string())?;
+        sqlx::query("UPDATE run_agents SET output = $2, summary = $3 WHERE id = $1").bind(orchestrator.id).bind(&intent_text).bind(plan["rationale"].as_str()).execute(&database).await.map_err(|error| error.to_string())?;
+        ctx.event("orchestrator_decision", format!("Decision to make: {decision}")).from(ORCHESTRATOR).data(json!({"intent": plan["intent"], "rationale": plan["rationale"]})).publish(&state).await;
 
-    let specs: Vec<AgentSpec> = serde_json::from_value(plan["agents"].clone()).map_err(|error| format!("plan has invalid agents: {error}"))?;
-    let specs = validate_team(&ctx, specs, &HashSet::new()).await;
-    if specs.is_empty() {
-        return Err("orchestrator hired no agents".into());
+        let specs: Vec<AgentSpec> = serde_json::from_value(plan["agents"].clone()).map_err(|error| format!("plan has invalid agents: {error}"))?;
+        let specs = validate_team(&ctx, specs, &HashSet::new()).await;
+        if specs.is_empty() {
+            return Err("orchestrator hired no agents".into());
+        }
+        hire_all(&ctx, &specs, 1, ORCHESTRATOR).await?;
     }
-    hire_all(&ctx, &specs, 1, ORCHESTRATOR).await?;
 
     // Rounds: the critic can send the team back for one more pass.
     let mut round = 1;
@@ -335,14 +373,6 @@ async fn validate_team(ctx: &RunContext, specs: Vec<AgentSpec>, existing: &HashS
         if spec.key.is_empty() || seen.contains(&spec.key) || spec.objective.trim().is_empty() {
             continue;
         }
-        let mut skills = Vec::new();
-        for skill in spec.skills.drain(..) {
-            let slug = super::skills::slugify(&skill);
-            if harness.skills.known(&slug).await && !skills.contains(&slug) && skills.len() < 3 {
-                skills.push(slug);
-            }
-        }
-        spec.skills = skills;
         spec.depends_on.retain(|dependency| seen.contains(dependency) && dependency != ORCHESTRATOR);
         spec.depends_on.dedup();
         if spec.role.trim().is_empty() {
@@ -394,6 +424,12 @@ async fn validate_team(ctx: &RunContext, specs: Vec<AgentSpec>, existing: &HashS
             spec.depends_on.retain(|dependency| before.contains(dependency) || existing.contains(dependency));
             before.push(spec.key.clone());
         }
+    }
+    // Skill resolution: keep the orchestrator's valid picks; agents hired without (valid) skills get index matches
+    // for their own role and objective. A lookup in the skill index, not a model call.
+    for spec in team.iter_mut() {
+        let picked = harness.skills.resolve(&spec.skills, "", "", 3).await;
+        spec.skills = if picked.is_empty() { harness.skills.resolve(&[], &format!("{} {}", spec.name, spec.role), &spec.objective, 2).await } else { picked };
     }
     team
 }
@@ -653,8 +689,8 @@ async fn run_agent(ctx: &RunContext, agent: RunAgent) -> Result<(), String> {
     let chart_readers = all.iter().any(|candidate| candidate.skills.iter().any(|skill| skill == "chart-reading-technical") || candidate.key.contains("chart"));
     let reads_charts = agent.skills.iter().any(|skill| skill == "chart-reading-technical") || agent.key.contains("chart") || agent.kind == "strategist" || (!chart_readers && agent.kind == "intent");
     let attachments = match &trading { Some(trading) if reads_charts => trading.attachments.clone(), _ => vec![] };
-    let memory_block = if ctx.settings.memory && agent.kind != "critic" {
-        memory::render_context(&memory::recall(harness, ctx.project_id, &agent.objective, 8).await, 350)
+    let memory_block = if agent.kind != "critic" {
+        memory::render_context(&memory::recall(harness, ctx.project_id, &agent.objective, 8).await, MEMORY_AGENT_TOKENS)
     } else {
         String::new()
     };
@@ -669,7 +705,8 @@ async fn run_agent(ctx: &RunContext, agent: RunAgent) -> Result<(), String> {
         if ctx.cancelled.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
-        let evidence = if native_web || agent.kind == "strategist" { String::new() } else { gather_evidence(ctx, &agent, &open_questions).await };
+        let replay = trading.as_ref().is_some_and(|trading| trading.as_of.is_some());
+        let evidence = if native_web || replay || agent.kind == "strategist" { String::new() } else { gather_evidence(ctx, &agent, &open_questions).await };
         let intent = ctx.intent.read().await.clone();
         let decision = ctx.decision.read().await.clone();
         let prompt = prompts::agent_prompt(&AgentBrief {
@@ -697,11 +734,13 @@ async fn run_agent(ctx: &RunContext, agent: RunAgent) -> Result<(), String> {
             model: routes[0].model.clone(),
             system: prompts::SYSTEM_CONSTITUTION.into(),
             prompt,
-            web: native_web && agent.kind != "strategist",
+            // Replay runs never browse: the web knows what happened next.
+            web: native_web && agent.kind != "strategist" && !trading.as_ref().is_some_and(|trading| trading.as_of.is_some()),
             timeout: Duration::from_secs(ctx.settings.agent_timeout_secs),
             json_schema: None,
             progress: Some(progress_forwarder(ctx, &agent.key)),
             attachments: attachments.clone(),
+            effort: ctx.settings.effort.clone(),
         };
         ctx.event("agent_iteration", format!("{} · iteration {iteration}/{}{}", agent.name, agent.max_iterations, if request.web { " · browsing the web" } else { "" }))
             .from(&agent.key)
@@ -766,9 +805,7 @@ async fn run_agent(ctx: &RunContext, agent: RunAgent) -> Result<(), String> {
         .publish(&ctx.state)
         .await;
 
-    if ctx.settings.memory {
-        retain_findings(ctx, &agent, &final_report).await;
-    }
+    retain_findings(ctx, &agent, &final_report).await;
     // Framing and review agents do not hire: the intent agent frames the work, the critic uses rounds instead.
     if ctx.settings.allow_agent_hiring && !matches!(agent.kind.as_str(), "critic" | "intent") {
         hire_requested(ctx, &agent, &final_report).await;
@@ -837,6 +874,7 @@ async fn gather_evidence(ctx: &RunContext, agent: &RunAgent, open_questions: &st
         json_schema: Some(prompts::queries_schema()),
         progress: None,
         attachments: vec![],
+        effort: None,
     };
     let queries: Vec<String> = match harness.llm_routed(&request, &router::resolve(&ctx.settings, "utility"), ctx.site(Some(agent.id), true)).await {
         Ok((response, _)) => response.structured.and_then(|value| serde_json::from_value(value["queries"].clone()).ok()).unwrap_or_default(),
@@ -1028,15 +1066,19 @@ async fn finalize(ctx: &RunContext, orchestrator_id: Uuid) -> Result<(), String>
             None => harness.quant.detect(plan["symbol"].as_str().unwrap_or_default()).await,
         };
         let recorded = match &symbol {
-            Some(symbol) => super::market::record_prediction(database, &harness.quant, (ctx.project_id, ctx.task_id, ctx.run_id), symbol, plan, trading.horizon_hours, trading.model_prob_up).await,
+            Some(symbol) => super::market::record_prediction(database, &harness.quant, (ctx.project_id, ctx.task_id, ctx.run_id), symbol, plan, trading.horizon_hours, trading.model_prob_up, trading.as_of).await,
             None => None,
         };
         match recorded {
             Some(_) => ctx.event("prediction_recorded", format!("Prediction recorded for {}: {} at {:.0}% — scored automatically in {}h.", symbol.unwrap_or_default(), plan["direction"].as_str().unwrap_or("neutral"), plan["probability"].as_f64().unwrap_or(0.5) * 100.0, plan["horizon_hours"].as_i64().unwrap_or(trading.horizon_hours as i64))).from(ORCHESTRATOR).publish(&ctx.state).await,
             None => ctx.event("prediction_skipped", "Trade plan not recorded for scoring (no recognised instrument or no reference price from the quant sidecar).").from(ORCHESTRATOR).publish(&ctx.state).await,
         }
+        // Replay: the horizon is already in the past, so the call is scored right away against what followed.
+        if trading.as_of.is_some() {
+            super::market::score_due(&ctx.state).await;
+        }
     }
-    if ctx.settings.memory {
+    {
         let scope = Scope { project_id: ctx.project_id, task_id: Some(ctx.task_id), run_id: Some(ctx.run_id), agent_key: Some(ORCHESTRATOR.into()) };
         memory::retain(&ctx.state.harness, &scope, vec![NewMemory { kind: "decision".into(), content: format!("Decision on \"{}\" ({}): {summary}", ctx.task_title, Utc::now().format("%Y-%m-%d")), entities: vec![], source_url: None, importance: 1.0, confidence: decision["confidence"].as_f64().map(|value| value as f32) }]).await;
         let consolidated = memory::consolidate(&ctx.state.harness, ctx.project_id, ctx.site(Some(orchestrator_id), true), &router::resolve(&ctx.settings, "utility")).await;
@@ -1044,6 +1086,22 @@ async fn finalize(ctx: &RunContext, orchestrator_id: Uuid) -> Result<(), String>
             ctx.event("memory_consolidated", format!("Consolidated findings into {consolidated} long-term observations.")).from(ORCHESTRATOR).publish(&ctx.state).await;
         }
     }
+    // Outcome statistics for every skill used in this run feed the selection prior.
+    let verdict = critic_report["verdict"].as_str().unwrap_or_default().to_ascii_lowercase();
+    let (accepted, revised) = if verdict.contains("accept") { (1, 0) } else if verdict.contains("revise") || verdict.contains("another") { (0, 1) } else { (0, 0) };
+    let used: HashSet<String> = agents.iter().flat_map(|agent| agent.skills.iter().cloned()).collect();
+    for skill in &used {
+        let _ = sqlx::query(
+            "INSERT INTO skill_stats (skill, uses, accepted, revised) VALUES ($1, 1, $2, $3)
+             ON CONFLICT (skill) DO UPDATE SET uses = skill_stats.uses + 1, accepted = skill_stats.accepted + $2, revised = skill_stats.revised + $3, updated_at = NOW()",
+        )
+        .bind(skill)
+        .bind(accepted)
+        .bind(revised)
+        .execute(database)
+        .await;
+    }
+    ctx.state.harness.refresh_skill_priors().await;
     set_status(ctx, orchestrator_id, "complete", None).await;
     let totals: (i64, i64, i64, i64, i32, i32) = sqlx::query_as("SELECT tokens_in, tokens_out, tokens_cache_read, tokens_saved, llm_calls, cache_hits FROM runs WHERE id = $1").bind(ctx.run_id).fetch_one(database).await.unwrap_or_default();
     ctx.event("run_complete", format!("Decision ready: {}", truncate_chars(&summary, 220)))
@@ -1075,15 +1133,22 @@ async fn prepare_trading(ctx: &RunContext, config: &Value) -> String {
         Some(symbol) => Some(symbol),
         None => harness.quant.detect(&format!("{} {}", ctx.task_title, ctx.task_brief)).await,
     };
-    let horizon = config["horizon"].as_str().unwrap_or("1d").to_string();
+    // Day-trade style: technical only (structure, sessions, retests) with fixed-pip risk; swing keeps the full quant desk.
+    let daytrade = config["style"].as_str() == Some("daytrade");
+    let as_of = config["as_of"].as_str().and_then(|text| DateTime::parse_from_rfc3339(text).ok()).map(|time| time.with_timezone(&Utc)).filter(|time| *time < Utc::now());
+    let sl_pips = config["sl_pips"].as_f64().unwrap_or(20.0);
+    let tp_pips = config["tp_pips"].as_f64().unwrap_or(50.0);
+    let tp2_pips = config["tp2_pips"].as_f64().unwrap_or(100.0);
+    let pip = config["pip"].as_f64().filter(|pip| *pip > 0.0);
+    let horizon = config["horizon"].as_str().unwrap_or(if daytrade { "8h" } else { "1d" }).to_string();
     let horizon_hours = super::market::horizon_hours(&horizon);
-    let timeframes: Vec<String> = config["timeframes"].as_array().map(|items| items.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>()).filter(|items| !items.is_empty()).unwrap_or_else(|| default_timeframes(horizon_hours));
+    let timeframes: Vec<String> = config["timeframes"].as_array().map(|items| items.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>()).filter(|items| !items.is_empty()).unwrap_or_else(|| if daytrade { ["4h", "1h", "15m", "5m"].iter().map(|frame| frame.to_string()).collect() } else { default_timeframes(horizon_hours) });
     let mut market = String::new();
     let mut model_prob_up = None;
     match &symbol {
         Some(symbol) => {
             ctx.event("market_loading", format!("Loading market data pack for {symbol} ({}) · horizon {horizon}…", timeframes.join(", "))).from(ORCHESTRATOR).publish(&ctx.state).await;
-            match harness.quant.snapshot(symbol, &timeframes, &horizon).await {
+            match harness.quant.snapshot(symbol, &timeframes, &horizon, as_of).await {
                 Ok(snapshot) => {
                     market = snapshot["markdown"].as_str().unwrap_or_default().to_string();
                     model_prob_up = snapshot["prediction"]["prob_up"].as_f64();
@@ -1099,12 +1164,78 @@ async fn prepare_trading(ctx: &RunContext, config: &Value) -> String {
         }
         None => ctx.event("market_unavailable", "Trading desk: no instrument recognised in the task text; the chart reader will identify it from the screenshot.").from(ORCHESTRATOR).publish(&ctx.state).await,
     }
+    if let (true, Some(symbol)) = (daytrade, &symbol) {
+        let mut sections: Vec<String> = Vec::new();
+        let mut pip_size = pip;
+        match harness.quant.session_story(symbol, "15m", pip, sl_pips, tp_pips, as_of).await {
+            Ok(story) => {
+                if let Some(markdown) = story["markdown"].as_str() { sections.push(format!("## Session story (how each session acted, where we are now, next triggers)\n{markdown}")) }
+                ctx.event("session_story", format!("Session story loaded for {symbol}: last sessions, current lines and next triggers.")).from(ORCHESTRATOR).data(json!({"now": story["now"], "next_actions": story["next_actions"]})).publish(&ctx.state).await;
+            }
+            Err(error) => ctx.event("market_unavailable", format!("Session story unavailable ({error}).")).from(ORCHESTRATOR).publish(&ctx.state).await,
+        }
+        let mut mtf_query = vec![("symbol".to_string(), symbol.clone()), ("intervals".to_string(), timeframes.join(",")), ("sl_pips".to_string(), sl_pips.to_string()), ("tp_pips".to_string(), tp_pips.to_string()), ("tp2_pips".to_string(), tp2_pips.to_string())];
+        if let Some(pip) = pip { mtf_query.push(("pip".to_string(), pip.to_string())) }
+        if let Some(as_of) = as_of { mtf_query.push(("as_of".to_string(), as_of.to_rfc3339())) }
+        match harness.quant.mtf(&mtf_query).await {
+            Ok(mtf) => {
+                pip_size = pip_size.or(mtf["params"]["pip"].as_f64().filter(|pip| *pip > 0.0));
+                if let Some(markdown) = mtf["markdown"].as_str() { sections.push(format!("## Top-down read (H4 context → H1 setup → M15/M5 trigger: boxes, impulses, failed sweeps, playbook, measured odds)\n{markdown}")) }
+                ctx.event("top_down", format!("Top-down read loaded for {symbol}: {}.", mtf["playbook"]["mode"].as_str().unwrap_or("no playbook"))).from(ORCHESTRATOR).data(json!({"playbook": mtf["playbook"], "stack": mtf["stack"], "needs": mtf["needs"]})).publish(&ctx.state).await;
+            }
+            Err(error) => ctx.event("market_unavailable", format!("Top-down read unavailable ({error}); the head trader needs H4 and H1 screenshots to judge the range.")).from(ORCHESTRATOR).publish(&ctx.state).await,
+        }
+        let mut levels_query = vec![("symbol".to_string(), symbol.clone()), ("intervals".to_string(), "4h,1h,15m".to_string())];
+        if let Some(pip) = pip { levels_query.push(("pip".to_string(), pip.to_string())) }
+        if let Some(as_of) = as_of { levels_query.push(("as_of".to_string(), as_of.to_rfc3339())) }
+        if let Ok(levels) = harness.quant.levels(&levels_query).await {
+            if let Some(markdown) = levels["markdown"].as_str() { sections.push(format!("## Lines and reactions (zones, touches, hold-vs-break odds, M15 → H1 → H4 stack)\n{markdown}")) }
+        }
+        let mut retest_query = vec![("symbol".to_string(), symbol.clone()), ("interval".to_string(), "15m".to_string()), ("level_interval".to_string(), "1h".to_string()), ("sl_pips".to_string(), sl_pips.to_string()), ("tp_pips".to_string(), tp_pips.to_string())];
+        if let Some(pip) = pip { retest_query.push(("pip".to_string(), pip.to_string())) }
+        if let Some(as_of) = as_of { retest_query.push(("as_of".to_string(), as_of.to_rfc3339())) }
+        if let Ok(retest) = harness.quant.retest(&retest_query).await {
+            if let Some(markdown) = retest["markdown"].as_str() { sections.push(format!("## Retest lab (history of this exact entry model)\n{markdown}")) }
+        }
+        let rules = format!(
+            "## Desk rules (day trade — binding)\nTechnical only: body-close structure lines, sessions, break → retest → rejection entries. News is timing only (blackout around releases), never a reason to enter.\nRead top-down: H4 = context, H1 = setup, M15/M5 = trigger. A lower timeframe trending inside a higher-timeframe consolidation is noise until an edge of that box is reached.\nWhen H4/H1 consolidate and price is inside the box: the plan is a RANGE plan — a sell zone at the top edge and a buy zone at the bottom edge, each with its own stop, targets and M15/M5 trigger; the middle of the box is no trade.\nA wick beyond an edge that closes back inside is a sweep, not a break. Only a body close beyond the edge on the setup timeframe breaks the range; then the plan is break → retest of that edge.\nPrices: the user's screenshots show their broker's prices and candle closes and are authoritative for exact levels. The data pack comes from a free feed that can sit several dollars/pips away from the broker and can close a candle on the other side of a line. When both exist, quote every level in screenshot prices, state the offset you see between the two, and use the data pack for structure, history and odds only. Without screenshots, say that levels are from the free feed and must be matched to the user's chart before acting.\nRisk: stop {sl_pips} pips beyond the line; targets {tp_pips} and {tp2_pips} pips{}. Entries on M15/M5 only, in the direction the H4/H1 read allows.\n",
+            pip_size.map(|pip| format!(". PIP SIZE: 1 pip = {pip} in price, so the stop is {:.2}, the targets are {:.2} and {:.2} in price, and a 1.00 move is {:.0} pips. Convert every pip figure with this size and never treat a pip as one whole price unit; a stop or target that does not match these distances is wrong unless you state why you deviate", sl_pips * pip, tp_pips * pip, tp2_pips * pip, 1.0 / pip)).unwrap_or_default()
+        );
+        let now = as_of.unwrap_or_else(Utc::now);
+        let rules = format!("{rules}Now: {} UTC. Use this weekday and date for every session and release time you name.\n", now.format("%A %Y-%m-%d %H:%M"));
+        sections.insert(0, rules);
+        sections.push(market);
+        market = sections.join("\n\n");
+    }
+    // Headlines from free sources, as timing context and reasons to wait (never in replay: that would leak the future).
+    if let (Some(symbol), None) = (&symbol, as_of) {
+        let hits = super::web::search(&ctx.state.database, &harness.http, &format!("{} price news today", headline_subject(symbol)), 6).await;
+        if !hits.is_empty() {
+            let lines: Vec<String> = hits.iter().map(|hit| format!("- {} — {} ({})", truncate_chars(&hit.title, 140), truncate_chars(&hit.snippet, 220), hit.url)).collect();
+            market = format!("{market}\n\n## Headlines (free web search, unverified; use for timing and risk only)\n{}", lines.join("\n"));
+        }
+    }
     if !attachments.is_empty() {
         ctx.event("charts_attached", format!("{} chart screenshot(s) attached for the chart reader.", attachments.len())).from(ORCHESTRATOR).publish(&ctx.state).await;
     }
-    let brief = prompts::desk_brief(symbol.as_deref(), horizon_hours, &timeframes, attachments.len(), &market);
-    *ctx.trading.write().await = Some(Trading { symbol, horizon_hours, market, model_prob_up, attachments });
+    if let Some(as_of) = as_of {
+        market = format!("## REPLAY MODE\nThe current moment is {} UTC. You know nothing that happened after it: no web browsing, no later prices or news. Analyse exactly as if this were live.\n\n{market}", as_of.format("%Y-%m-%d %H:%M"));
+        ctx.event("replay_mode", format!("Replay: analysing as of {} UTC with no look-ahead; the plan is scored immediately against what followed.", as_of.format("%Y-%m-%d %H:%M"))).from(ORCHESTRATOR).publish(&ctx.state).await;
+    }
+    let brief = if daytrade { prompts::daytrade_brief(symbol.as_deref(), horizon_hours, &timeframes, attachments.len(), &market, sl_pips, tp_pips, tp2_pips) } else { prompts::desk_brief(symbol.as_deref(), horizon_hours, &timeframes, attachments.len(), &market) };
+    *ctx.trading.write().await = Some(Trading { symbol, horizon_hours, market, model_prob_up, attachments, as_of });
     brief
+}
+
+/// Search subject for headlines: the name news sites use for the instrument.
+fn headline_subject(symbol: &str) -> String {
+    let upper = symbol.to_uppercase();
+    match upper.as_str() {
+        "XAUUSD" => "gold XAUUSD".into(),
+        "XAGUSD" => "silver XAGUSD".into(),
+        _ if upper.len() == 6 && upper.chars().all(|c| c.is_ascii_alphabetic()) => format!("{}/{} forex", &upper[..3], &upper[3..]),
+        _ => upper,
+    }
 }
 
 fn default_timeframes(horizon_hours: i32) -> Vec<String> {
@@ -1132,6 +1263,56 @@ fn render_trade_plan(plan: &Value) -> String {
         plan["timing"].as_str().unwrap_or("–"),
         plan["invalidation"].as_str().unwrap_or("–"),
     );
+    if let Some(frames) = plan["timeframes"].as_array().filter(|frames| !frames.is_empty()) {
+        out.push_str("\n**Top-down read**\n");
+        for frame in frames {
+            out.push_str(&format!("- **{}** — {}: {}\n", frame["tf"].as_str().unwrap_or("?"), frame["state"].as_str().unwrap_or("?").replace('_', " "), frame["read"].as_str().unwrap_or_default()));
+        }
+    }
+    if let Some(zones) = plan["zones"].as_array().filter(|zones| !zones.is_empty()) {
+        out.push_str("\n**Zones**\n| | Zone | Stop | Targets | Trigger |\n|---|---|---|---|---|\n");
+        for zone in zones {
+            out.push_str(&format!("| {} | {} | {} | {} | {} |\n", zone["side"].as_str().unwrap_or("?").to_uppercase(), list(&zone["zone"]), number(&zone["stop"]), list(&zone["targets"]), zone["trigger"].as_str().unwrap_or("–").replace('|', "/")));
+        }
+    }
+    if let Some(reasons) = plan["reasons"].as_array().filter(|reasons| !reasons.is_empty()) {
+        out.push_str("\n**Why**\n");
+        for reason in reasons.iter().filter_map(Value::as_str) {
+            out.push_str(&format!("- {reason}\n"));
+        }
+    }
+    if let Some(cases) = plan["cases"].as_array().filter(|cases| !cases.is_empty()) {
+        out.push_str("\n**Decision table**\n| Action | When | Entry | Stop | Targets | Reason | Risk |\n|---|---|---|---|---|---|---|\n");
+        let cell = |value: &Value| value.as_str().unwrap_or("–").replace('|', "/").replace('\n', " ");
+        for case in cases {
+            out.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} |\n", case["action"].as_str().unwrap_or("?").to_uppercase(), cell(&case["when"]), number(&case["entry"]), number(&case["stop"]), list(&case["targets"]), cell(&case["reason"]), cell(&case["risk"])));
+        }
+    }
+    if let Some(check) = plan["thesis_check"].as_object().filter(|check| check.get("view").and_then(Value::as_str).is_some_and(|view| !view.is_empty())) {
+        out.push_str(&format!("\n**Your prediction** ({}): {}\n- Confirms: {}\n- Invalidates: {}\n", check.get("verdict").and_then(Value::as_str).unwrap_or("?").replace('_', " "), check["view"].as_str().unwrap_or_default(), check.get("confirms").and_then(Value::as_str).unwrap_or("–"), check.get("invalidates").and_then(Value::as_str).unwrap_or("–")));
+    }
+    if let Some(news) = plan["news"].as_array().filter(|news| !news.is_empty()) {
+        out.push_str("\n**News**\n");
+        for item in news {
+            out.push_str(&format!("- {} — {}: {}\n", item["time"].as_str().unwrap_or("time n/a"), item["event"].as_str().unwrap_or("event"), item["effect"].as_str().unwrap_or_default()));
+        }
+    }
+    if let Some(risks) = plan["risks"].as_array().filter(|risks| !risks.is_empty()) {
+        out.push_str("\n**Risks**\n");
+        for risk in risks.iter().filter_map(Value::as_str) {
+            out.push_str(&format!("- {risk}\n"));
+        }
+    }
+    for (label, key) in [("To continue up", "up"), ("To continue down", "down")] {
+        if let Some(text) = plan["continuation"][key].as_str().filter(|text| !text.is_empty()) {
+            out.push_str(&format!("\n**{label}:** {text}\n"));
+        }
+    }
+    if let Some(needs) = plan["needs"].as_array().filter(|needs| !needs.is_empty()) {
+        out.push_str("\n**Needed for a firmer read:** ");
+        out.push_str(&needs.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" · "));
+        out.push('\n');
+    }
     if let Some(events) = plan["key_events"].as_array().filter(|events| !events.is_empty()) {
         out.push_str("\n**Key events:** ");
         out.push_str(&events.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" · "));

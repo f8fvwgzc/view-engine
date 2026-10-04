@@ -5,7 +5,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from .data import iso
+from .data import iso, now_utc
 
 SESSIONS = [
     ("Sydney", "Australia/Sydney", time(7, 0), time(16, 0)),
@@ -42,7 +42,7 @@ def _occurrences(tz: ZoneInfo, open_t: time, close_t: time, now: datetime, days=
 
 
 def get_sessions(now: Optional[datetime] = None) -> dict:
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = (now or now_utc()).astimezone(timezone.utc)
     out, active = [], []
     windows: dict[str, tuple[datetime, datetime]] = {}
     for name, tzname, ot, ct in SESSIONS:

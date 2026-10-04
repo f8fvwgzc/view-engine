@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::SharedState;
 
-const CHANNEL: &str = "godview.events";
+const CHANNEL: &str = "view-engine.events";
 
 #[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SwarmEvent {

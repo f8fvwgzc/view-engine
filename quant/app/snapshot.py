@@ -12,7 +12,7 @@ import pandas as pd
 from . import indicators as ind
 from .calendar import get_calendar
 from .correlation import correlation_report
-from .data import get_series, iso, norm_interval
+from .data import get_series, iso, norm_interval, now_ts, now_utc, replay_as_of, submit_ctx
 from .model import predict
 from .options import get_options
 from .sessions import get_sessions
@@ -51,7 +51,7 @@ def analysis(sym: Symbol, interval: str = "1d") -> dict:
     daily = s.df if interval == "1d" else _try(lambda: get_series(sym, "1d").df)
     basis = ind.PIVOT_BASIS.get(interval, "1d")
     higher = _try(lambda: get_series(sym, basis).df)
-    res = ind.analyze_frame(s.df, interval, daily=daily, higher=higher)
+    res = ind.analyze_frame(s.df, interval, daily=daily, higher=higher, now=now_ts())
     return {"symbol": sym.id, "name": sym.name, "interval": interval, **s.source_info, "ticker": s.ticker,
             "as_of": s.as_of, "delayed_minutes": s.delayed_minutes, "bars": len(s.df), **res}
 
@@ -96,7 +96,7 @@ def _tf_summary(a: dict) -> dict:
 
 
 def snapshot(sym: Symbol, timeframes: list[str], horizon: str = "1d", options_expiries: int = 3) -> dict:
-    now = datetime.now(timezone.utc)
+    now = now_utc()
     tfs = [norm_interval(t) for t in timeframes][:5]
     related = [REGISTRY[r] for r in sym.related if r in REGISTRY][:6]
     tasks: dict[str, Callable] = {f"tf:{tf}": (lambda tf=tf: analysis(sym, tf)) for tf in tfs}
@@ -105,7 +105,7 @@ def snapshot(sym: Symbol, timeframes: list[str], horizon: str = "1d", options_ex
     tasks["calendar"] = lambda: get_calendar(list(sym.currencies) or ["USD"], ["High", "Medium"], days=3,
                                              past_hours=24)
     tasks["sessions"] = lambda: get_sessions(now)
-    if sym.options_ticker:
+    if sym.options_ticker and replay_as_of() is None:
         tasks["options"] = lambda: get_options(sym, options_expiries)
     tasks["prediction"] = lambda: predict(sym, None, horizon)
     for tf in tfs:
@@ -113,7 +113,7 @@ def snapshot(sym: Symbol, timeframes: list[str], horizon: str = "1d", options_ex
             tasks[f"structure:{tf}"] = (lambda tf=tf: structure_analyze(sym, tf, 300, with_sessions=(tf == "1h")))
     results, errors = {}, {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {k: ex.submit(fn) for k, fn in tasks.items()}
+        futs = {k: submit_ctx(ex, fn) for k, fn in tasks.items()}
         for k, f in futs.items():
             try:
                 results[k] = f.result(timeout=240)
@@ -153,6 +153,9 @@ def snapshot(sym: Symbol, timeframes: list[str], horizon: str = "1d", options_ex
     st = {tf: _structure_summary(results[f"structure:{tf}"]) for tf in tfs if f"structure:{tf}" in results}
     if st:
         out["structure"] = st
+    if replay_as_of() is not None:
+        out["replay_as_of"] = iso(replay_as_of())
+        out["errors"].setdefault("options", "omitted in replay (no free historical option chains)")
     out = jsonable(out)
     out["markdown"] = render_markdown(out)
     return out
@@ -191,6 +194,9 @@ def render_markdown(s: dict) -> str:
     L: list[str] = []
     sym = s["symbol"]
     L.append(f"## {sym} ({s.get('name')}) — quant snapshot @ {s['generated_at']}")
+    if s.get("replay_as_of"):
+        L.append(f"**REPLAY as of {s['replay_as_of']}** — only candles closed by then were used; live-only sections "
+                 f"(options, calendar for past weeks) are omitted.")
     lb = ", ".join(f"{tf} {str(t.get('last_time'))[:16]}Z" for tf, t in (s.get("timeframes") or {}).items())
     src = str(s.get("source") or "").split(" (")[0].split(", basis-adjusted")[0]
     L.append(f"_Prices: {src} `{s.get('ticker')}`; last bar start: {lb or s.get('as_of')}; est. feed "
@@ -201,7 +207,9 @@ def render_markdown(s: dict) -> str:
         L.append(f"**Levels are SPOT terms**: futures candles minus basis {bi['basis']:+.2f} (futures "
                  f"{_price_fmt(bi['futures_price'])} @ {str(bi['futures_as_of'])[:16]}Z − spot "
                  f"{_price_fmt(bi['spot_price'])} @ {str(bi['spot_as_of'])[:16]}Z, {bi['spot_source']}"
-                 f"{', STALE' if bi.get('stale') else ''}). Older levels approximate (basis drifts with carry/roll).")
+                 f"{', STALE' if bi.get('stale') else ''}). "
+                 + ("Basis is time-varying (anchored on cached Dukascopy spot days)." if bi.get("time_varying")
+                    else "Older levels approximate (basis drifts with carry/roll)."))
     ses = s.get("sessions")
     if ses:
         ov = ", ".join("+".join(x) for x in ses.get("current_overlaps") or []) or "none"

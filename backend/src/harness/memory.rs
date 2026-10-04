@@ -354,6 +354,7 @@ pub async fn consolidate(harness: &Harness, project_id: Uuid, site: CallSite, ro
         json_schema: Some(super::prompts::consolidation_schema()),
         progress: None,
         attachments: vec![],
+        effort: None,
     };
     let Ok((response, _)) = harness.llm_routed(&request, routes, site).await else { return 0 };
     let Some(plan) = response.structured else { return 0 };

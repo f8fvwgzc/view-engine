@@ -25,3 +25,7 @@ quant/.venv
 quant/.cache
 __pycache__/
 .pytest_cache/
+
+# user skill library: local data, not shipped with the engine
+skills/*
+!skills/README.md

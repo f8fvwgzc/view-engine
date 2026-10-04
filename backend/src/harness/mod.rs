@@ -108,6 +108,20 @@ impl Harness {
         }
     }
 
+    /// Loads skill outcome statistics into the index prior: skills with a good track record rank up to 10% higher,
+    /// poor ones up to 10% lower; skills with fewer than three recorded outcomes stay neutral.
+    pub async fn refresh_skill_priors(&self) {
+        let rows: Vec<(String, i32, i32, i32, i32)> = sqlx::query_as("SELECT skill, accepted, revised, hits, misses FROM skill_stats").fetch_all(&self.database).await.unwrap_or_default();
+        let prior = rows
+            .into_iter()
+            .filter_map(|(skill, accepted, revised, hits, misses)| {
+                let outcomes = accepted + revised + hits + misses;
+                (outcomes >= 3).then(|| (skill, 0.9 + 0.2 * (accepted + hits) as f64 / outcomes as f64))
+            })
+            .collect();
+        self.skills.set_priors(prior).await;
+    }
+
     pub async fn note_limit(&self, provider: &str, mut info: serde_json::Value) {
         if let Some(object) = info.as_object_mut() {
             object.insert("observed_at".into(), serde_json::json!(chrono::Utc::now()));

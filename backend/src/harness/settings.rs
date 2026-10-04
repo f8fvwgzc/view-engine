@@ -2,7 +2,7 @@
 //!
 //! There is deliberately no money budget: CLI providers run on the user's own subscription limits and local
 //! models are free. Runs are bounded by team size, iterations, rounds and timeouts; efficiency comes from
-//! caching, compression and memory, and a provider's own usage-limit error triggers the router's fallback.
+//! caching, compression and memory (always on), and a provider's own usage-limit error triggers the router's fallback.
 
 use std::collections::BTreeMap;
 
@@ -37,10 +37,11 @@ pub struct RunSettings {
     /// Node-level retries after in-call retries are exhausted (Symphony failure backoff).
     pub max_attempts: i32,
     pub agent_timeout_secs: u64,
-    /// Long-term memory: recall before planning/agents, retain findings, consolidate after the run.
-    pub memory: bool,
     /// Let agents ask the orchestrator to hire extra specialists mid-run.
     pub allow_agent_hiring: bool,
+    /// Reasoning effort passed to providers that support it: low | medium | high | xhigh | max. None = the
+    /// provider's default; the fast day-trade path uses low unless this is set.
+    pub effort: Option<String>,
 }
 
 impl Default for RunSettings {
@@ -58,8 +59,8 @@ impl Default for RunSettings {
             max_rounds: 1,
             max_attempts: 3,
             agent_timeout_secs: 900,
-            memory: true,
             allow_agent_hiring: true,
+            effort: None,
         }
     }
 }
@@ -109,6 +110,7 @@ impl RunSettings {
         self.max_rounds = self.max_rounds.clamp(0, 3);
         self.max_attempts = self.max_attempts.clamp(1, 6);
         self.agent_timeout_secs = self.agent_timeout_secs.clamp(60, 3600);
+        self.effort = self.effort.take().map(|effort| effort.trim().to_lowercase()).filter(|effort| ["low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()));
     }
 }
 

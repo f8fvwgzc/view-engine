@@ -1,6 +1,6 @@
 .PHONY: dev infra backend frontend quant test containers down
 
-DATABASE_URL ?= postgres://godview:godview@localhost:5433/godview
+DATABASE_URL ?= postgres://viewengine:viewengine@localhost:5433/viewengine
 
 # Postgres + Redis in Docker, API and UI on the host (so the API can launch your Claude Code / Codex / Copilot CLIs).
 dev: infra

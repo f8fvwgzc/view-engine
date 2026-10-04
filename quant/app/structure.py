@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
-from .data import INTERVALS, bar_close_time, get_series, iso
+from .data import INTERVALS, bar_close_time, day_close_mode, get_series, iso, now_ts, ns_index
 from .sessions import SESSIONS, _occurrences, fx_market_open
 from .symbols import Symbol
 
@@ -147,6 +147,9 @@ class StructureRun:
     events: list[Event]
     trend: list[str]  # trend state after each bar (as known at that bar's close)
     last_bos: list[Optional[int]]  # index into events of most recent BOS as of each bar
+    history: list[Swing] = field(default_factory=list)  # every swing as it was confirmed in real time
+    # (`swings` is the final alternated list: swings later replaced by a more extreme one are dropped from it,
+    #  so anything that must be look-ahead free over history should use `history`)
 
 
 def run_structure(df: pd.DataFrame, left: int = 2, right: int = 2) -> StructureRun:
@@ -156,6 +159,7 @@ def run_structure(df: pd.DataFrame, left: int = 2, right: int = 2) -> StructureR
     for s in raw_swings(df, left, right):
         by_conf.setdefault(s.confirmed_idx, []).append(s)
     alt: list[Swing] = []
+    history: list[Swing] = []
     events: list[Event] = []
     trend, last_bos = [], []
     ref_h: Optional[Swing] = None
@@ -185,13 +189,14 @@ def run_structure(df: pd.DataFrame, left: int = 2, right: int = 2) -> StructureR
             prev = next((x for x in reversed(alt) if x.kind == s.kind), None)
             s.label = _label(s, prev)
             alt.append(s)
+            history.append(s)
             if s.kind == "H":
                 ref_h = s
             else:
                 ref_l = s
         trend.append(trend_from_swings(alt))
         last_bos.append(bos_i)
-    return StructureRun(alt, events, trend, last_bos)
+    return StructureRun(alt, events, trend, last_bos, history)
 
 
 # ------------------------------------------------------------------ boxes
@@ -258,11 +263,11 @@ def next_close_after(last_close: pd.Timestamp, interval: str, now: pd.Timestamp,
 
 
 def closed_frame(df: pd.DataFrame, interval: str, fx_day: bool, now: Optional[pd.Timestamp] = None):
-    now = now or pd.Timestamp.now(tz="UTC")
+    now = now or now_ts()
     if INTERVALS[interval][3]:
         closes = df.index + pd.Timedelta(hours=INTERVALS[interval][4])
     else:
-        closes = pd.DatetimeIndex([bar_close_time(t, interval, fx_day) for t in df.index])
+        closes = ns_index([bar_close_time(t, interval, fx_day) for t in df.index])
     mask = closes <= now
     forming = None
     if not mask[-1]:
@@ -312,16 +317,6 @@ def is_fx_like(sym: Symbol) -> bool:
     return bool(sym.asset_class in ("fx", "metal") or (sym.yahoo or "").endswith("=X"))
 
 
-def day_close_mode(sym: Symbol):
-    """Daily-bar close convention: 'fx' (17:00 NY), 'us' (16:00 NY cash close) or False (00:00 UTC)."""
-    if is_fx_like(sym) or sym.asset_class == "commodity" or (sym.yahoo or "").endswith((".NYB", "=F")):
-        return "fx"
-    t = sym.yahoo or ""
-    if sym.asset_class in ("etf", "equity") and "." not in t or t in ("^GSPC", "^NDX", "^DJI", "^VIX", "^TNX"):
-        return "us"
-    return False
-
-
 @dataclass
 class Context:
     """Closed-candle structure state for a symbol/interval (shared by /signals and the structure model)."""
@@ -355,35 +350,45 @@ def htf_trend_series(sym: Symbol, htf: str, now: pd.Timestamp) -> pd.Series:
 
 
 def build_context(sym: Symbol, interval: str, now: Optional[pd.Timestamp] = None,
-                  max_bars: int = 6000) -> Context:
-    now = now or pd.Timestamp.now(tz="UTC")
-    series = get_series(sym, interval)
+                  max_bars: int = 6000, history_days: Optional[int] = None) -> Context:
+    now = now or now_ts()
+    series = get_series(sym, interval, history_days)
     df, closes, forming, _ = closed_frame(series.df, interval, day_close_mode(sym), now)
     df, closes = df.iloc[-max_bars:], closes[-max_bars:]
     if len(df) < 30:
         raise ValueError(f"not enough closed {interval} candles ({len(df)})")
-    a = ind.atr(df, 14)
-    atr_prev = a.shift(1).to_numpy(float)
-    imp = impulse_flags(df, atr_prev)
-    run = run_structure(df)
     htf = HTF.get(interval, "1d")
     try:
         hs = htf_trend_series(sym, htf, now) if htf != interval else pd.Series(dtype=float)
     except Exception:
         hs = pd.Series(dtype=float)
-    if len(hs):
-        aligned = pd.merge_asof(pd.DataFrame({"t": closes}), pd.DataFrame({"t": hs.index, "v": hs.values}),
+    return context_from_frame(sym, interval, df, closes, forming, series.source, series.delayed_minutes,
+                              htf, hs, series.source_info)
+
+
+def context_from_frame(sym: Optional[Symbol], interval: str, df: pd.DataFrame, closes: pd.DatetimeIndex,
+                       forming: Optional[dict] = None, source: str = "synthetic", delayed_minutes: int = 0,
+                       htf: Optional[str] = None, htf_trend: Optional[pd.Series] = None,
+                       source_info: Optional[dict] = None) -> Context:
+    """Build the causal structure state from CLOSED candles (no I/O; used by tests and the backtest)."""
+    a = ind.atr(df, 14)
+    atr_prev = a.shift(1).to_numpy(float)
+    imp = impulse_flags(df, atr_prev)
+    run = run_structure(df)
+    if htf_trend is not None and len(htf_trend):
+        aligned = pd.merge_asof(pd.DataFrame({"t": ns_index(closes)}),
+                                pd.DataFrame({"t": ns_index(htf_trend.index), "v": htf_trend.values}),
                                 on="t", direction="backward")["v"].fillna(0).to_numpy(float)
     else:
         aligned = np.zeros(len(df))
-    return Context(sym, interval, series.source, series.delayed_minutes, df, closes, forming, a.to_numpy(float),
-                   atr_prev, imp, run, htf, aligned, np.array([_TN[x] for x in run.trend], float),
-                   series.source_info)
+    return Context(sym, interval, source, delayed_minutes, df, closes, forming, a.to_numpy(float), atr_prev, imp,
+                   run, htf or HTF.get(interval, "1d"), aligned, np.array([_TN[x] for x in run.trend], float),
+                   source_info)
 
 
 def analyze(sym: Symbol, interval: str = "1h", lookback: int = 300, left: int = 2, right: int = 2,
             now: Optional[pd.Timestamp] = None, with_sessions: bool = True) -> dict:
-    now = now or pd.Timestamp.now(tz="UTC")
+    now = now or now_ts()
     series = get_series(sym, interval)
     fx_day = day_close_mode(sym)
     full, closes_full, forming, _ = closed_frame(series.df, interval, fx_day, now)
@@ -565,9 +570,10 @@ def signals(sym: Symbol, intervals: list[str], now: Optional[pd.Timestamp] = Non
     """Evaluate the latest CLOSED candle on each interval; MTF alignment vs the largest interval's trend."""
     from .model import continuation_probability, public_structure_model, structure_model
 
-    now = now or pd.Timestamp.now(tz="UTC")
+    now = now or now_ts()
     ivs = sorted(dict.fromkeys(intervals), key=lambda x: INTERVALS[x][4], reverse=True)
     out, errors, ctxs = {}, {}, {}
+    extra_ctx: dict[str, Context] = {}
     for iv in ivs:
         try:
             ctxs[iv] = build_context(sym, iv, now)
@@ -611,6 +617,49 @@ def signals(sym: Symbol, intervals: list[str], now: Optional[pd.Timestamp] = Non
                 bx = sg["box"]
                 sg["box"] = {"low": bx["low"], "high": bx["high"], "n_candles": bx["n_inside"] + 1,
                              "width_atr": (bx["high"] - bx["low"]) / atr if atr else None}
+        # range signals: wick sweep of a box edge that closed back inside / first arrival at an edge zone
+        try:
+            from .mtf import range_signals
+            from .retest import default_pip as _dp
+            for rs in range_signals(ctx, _dp(sym)):
+                d = 1 if rs["direction"] == "up" else -1
+                tn = {"up": 1, "down": -1}.get(ref_trend, 0)
+                rs.update({
+                    "impulse": bool(ctx.imp[end]),
+                    "mtf": {"reference_interval": ref_iv, "reference_trend": ref_trend,
+                            "alignment": "aligned" if tn == d else "counter" if tn == -d else "neutral"},
+                    "candle_time": iso(df.index[end]), "candle_close_time": iso(cc),
+                    "session_at_close": session_label(cc), "id": signal_id(sym.id, iv, rs["type"], cc),
+                    "continuation_probability": None, "model_note": "see /mtf odds for historical rates",
+                })
+                sigs.append(rs)
+        except Exception as e:
+            errors[f"{iv}:range"] = f"{type(e).__name__}: {str(e)[:200]}"
+        # break -> retest signals (levels from this interval and its higher timeframe)
+        try:
+            from .retest import default_pip, retest_signals
+            lvl_iv = HTF.get(iv, iv)
+            lvl_ctx = ctxs.get(lvl_iv)
+            if lvl_ctx is None and lvl_iv != iv:
+                lvl_ctx = extra_ctx.get(lvl_iv)
+                if lvl_ctx is None:
+                    lvl_ctx = extra_ctx[lvl_iv] = build_context(sym, lvl_iv, now)
+            for rs in retest_signals(ctx, lvl_ctx, default_pip(sym)):
+                d = 1 if rs["direction"] == "up" else -1
+                tn = {"up": 1, "down": -1}.get(ref_trend, 0)
+                rs.update({
+                    "impulse": bool(ctx.imp[end]),
+                    "body_atr": float(abs(df["c"].iloc[end] - df["o"].iloc[end]) / ctx.atr_prev[end])
+                    if np.isfinite(ctx.atr_prev[end]) else None,
+                    "mtf": {"reference_interval": ref_iv, "reference_trend": ref_trend,
+                            "alignment": "aligned" if tn == d else "counter" if tn == -d else "neutral"},
+                    "candle_time": iso(df.index[end]), "candle_close_time": iso(cc),
+                    "session_at_close": session_label(cc), "id": signal_id(sym.id, iv, rs["type"], cc),
+                    "continuation_probability": None, "model_note": "see /retest for historical statistics",
+                })
+                sigs.append(rs)
+        except Exception as e:
+            errors[f"{iv}:retest"] = f"{type(e).__name__}: {str(e)[:200]}"
         out[iv] = {
             "last_closed_candle": {"start": iso(df.index[end]), "close_time": iso(cc), "o": float(df["o"].iloc[end]),
                                    "h": float(df["h"].iloc[end]), "l": float(df["l"].iloc[end]),
@@ -622,6 +671,38 @@ def signals(sym: Symbol, intervals: list[str], now: Optional[pd.Timestamp] = Non
                                 if k in ("status", "n_events", "base_hit_rate", "k_candles")} if model else None,
         }
         fired_all.extend(sigs)
+    # level_touch: the last closed candle of the LOWEST interval interacted with a top zone
+    try:
+        if len(ctxs) >= 1:
+            from .levels import last_candle_touches, levels_engine, touch_odds
+            base_iv = ivs[-1]
+            if base_iv in out:
+                pub, raw = levels_engine(sym, list(ctxs))
+                cc = raw["_last_close_time"]
+                for tch in last_candle_touches(raw, pub):
+                    z, kind = tch["zone"], tch["reaction"]
+                    od = tch["odds"] or touch_odds(z, pub["statistics"], pub["intervals"], pub["now"]["session"])
+                    support = tch["raw"]["role_tested"] == "support"
+                    held = kind not in ("break", "retest_fail", "inside_zone")
+                    conf = od["conditions"]["confluence"]
+                    sg = {"type": "level_touch", "reaction": kind,
+                          "direction": ("up" if support else "down") if held else ("down" if support else "up")
+                          if kind != "inside_zone" else "undecided",
+                          "level": z["level"], "zone_low": z["low"], "zone_high": z["high"],
+                          "timeframes": z["timeframes"], "role_tested": tch["raw"]["role_tested"],
+                          "respected_touches": z["respected_touches"], "flips": z["flips"],
+                          "wick_depth_pips": tch["raw"]["wick_depth_pips"],
+                          "hold_probability": conf.get("p_hold"), "hold_probability_ci95": conf.get("ci95_hold"),
+                          "hold_probability_n": conf.get("n"), "hold_probability_basis": f"confluence = {conf['bucket']}",
+                          "odds": od["conditions"], "odds_text": od["text"],
+                          "candle_close_time": iso(cc), "session_at_close": session_label(cc),
+                          "id": signal_id(sym.id, base_iv, f"level_touch:{z['level']:.6g}", cc),
+                          "continuation_probability": None,
+                          "model_note": "hold_probability = historical share of such touches that held (see /levels)"}
+                    out[base_iv]["signals"].append(sg)
+                    fired_all.append(sg)
+    except Exception as e:
+        errors["level_touch"] = f"{type(e).__name__}: {str(e)[:200]}"
     return {"symbol": sym.id, "evaluated_at": iso(now), "intervals": out, "fired": len(fired_all),
             "fired_ids": [s["id"] for s in fired_all], "errors": errors,
             **((next(iter(ctxs.values())).source_info or {}) if ctxs else {"source": None}),

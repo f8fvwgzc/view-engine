@@ -29,7 +29,7 @@ export function TaskPanel({ project, task, detail, selectedAgent, onSelectTask, 
     </section>
     <div className="task-list">
       {project?.tasks.map((item) => <div key={item.id} className={`task-card ${item.id === task?.id ? 'selected' : ''}`} role="button" tabIndex={0} onClick={() => onSelectTask(item.id)} onKeyDown={(event) => { if (event.key === 'Enter') onSelectTask(item.id) }}>
-        <div className="task-card-top"><span className={`status-dot ${item.status}`} /><span className="task-status">{item.status}</span>{item.config.depth && <span className="task-chip">{item.config.depth}</span>}{item.config.provider && <span className="task-chip">{item.config.provider}</span>}
+        <div className="task-card-top"><span className={`status-dot ${item.status}`} /><span className="task-status">{item.status}</span>{item.config.depth && <span className="task-chip">{item.config.depth}</span>}{item.config.provider && <span className="task-chip">{item.config.provider}</span>}{item.config.as_of && <span className="task-chip replay">replay {new Date(item.config.as_of).toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })}</span>}{item.config.style && <span className="task-chip">{item.config.style}</span>}
           <button className="ghost-icon" onClick={(event) => { event.stopPropagation(); if (window.confirm(`Delete task “${item.title}” and its runs?`)) onDeleteTask(item.id) }} aria-label="Delete task"><Trash2 size={12} /></button>
         </div>
         <b>{item.title}</b>
@@ -57,7 +57,7 @@ function Inspector({ task, detail, liveEvents, onSelectAgent, prediction, onRun,
       {run?.error && <div className="run-error">{run.error}</div>}
       {run && <div className="tabs"><button className={tab === 'decision' ? 'active' : ''} onClick={() => setTab('decision')}>DECISION</button><button className={tab === 'report' ? 'active' : ''} onClick={() => setTab('report')} disabled={!run.report}>REPORT</button>{run.report && <button className="tab-action" onClick={onOpenReport} title="Open full report"><Maximize2 size={12} /></button>}</div>}
       {run && tab === 'decision' && <>
-        {decision?.trade_plan && <TradePlanCard plan={decision.trade_plan} run={run} prediction={prediction} />}
+        {decision?.trade_plan && <TradePlanCard plan={decision.trade_plan} run={run} prediction={prediction} asOf={task.config.as_of} />}
         {detail && <TeamRoster detail={detail} liveEvents={liveEvents} onSelectAgent={onSelectAgent} />}
         <MarketPack run={run} />
         {run.intent?.decision_to_make && <div className="intent-card"><span>DECISION TO MAKE</span><p>{run.intent.decision_to_make}</p>

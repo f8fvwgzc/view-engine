@@ -1,4 +1,4 @@
-//! GodView Engine API: a research harness where one orchestrator hires agents, runs them as a dependency graph,
+//! View Engine API: a research harness where one orchestrator hires agents, runs them as a dependency graph,
 //! and turns their web research into a decision-ready strategy. See `harness/` for the engine.
 
 mod api;
@@ -35,12 +35,15 @@ pub type SharedState = Arc<AppState>;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "godview_api=info,tower_http=warn".into())).init();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "view_engine_api=info,tower_http=warn".into())).init();
 
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://godview:godview@localhost:5433/godview".into());
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://viewengine:viewengine@localhost:5433/viewengine".into());
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let port: u16 = env::var("PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(3001);
-    let skills_dir = env::var("SKILLS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills"));
+    // The skill library is user data next to the repo (git-ignored): the engine ships without skills.
+    let skills_dir = env::var("SKILLS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("skills"));
+    // Local tool with no authentication: listen on localhost unless BIND_ADDR says otherwise (containers use 0.0.0.0).
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
 
     let database = PgPoolOptions::new()
         .max_connections(20)
@@ -61,14 +64,15 @@ async fn main() {
     let providers = ProviderConfig::from_env();
     let embedder = Embedder::detect(&http, &providers.ollama_url).await;
     let skills = SkillLibrary::load(skills_dir.clone()).await;
-    tracing::info!("loaded {} skills from {}", skills.list().await.len(), skills_dir.display());
+    tracing::info!("{} skills in {} (add your own or import from GitHub in Settings → Skills)", skills.len().await, skills_dir.display());
     let harness = Arc::new(Harness { database: database.clone(), http, providers, skills, embedder, limits: Default::default(), quant: harness::market::Quant::from_env(web::client()) });
 
+    harness.refresh_skill_priors().await;
     let state = Arc::new(AppState { database, redis, event_tx, harness, active_runs: Mutex::new(HashMap::new()) });
     tokio::spawn(harness::market::evaluator(state.clone()));
     tokio::spawn(harness::market::watcher(state.clone()));
     let app = Router::new()
-        .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok", "engine": "godview-research-harness"})) }))
+        .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok", "engine": "view-engine"})) }))
         .route("/api/dashboard", get(api::dashboard))
         .route("/api/projects", post(api::create_project))
         .route("/api/projects/:project_id", axum::routing::delete(api::delete_project))
@@ -84,12 +88,17 @@ async fn main() {
         .route("/api/watchlist/:id", axum::routing::delete(api::delete_watch))
         .route("/api/market/health", get(api::market_health))
         .route("/api/market/symbols", get(api::market_symbols))
+        .route("/api/market/backtest", get(api::market_backtest))
+        .route("/api/market/retest", get(api::market_retest))
+        .route("/api/market/levels", get(api::market_levels))
+        .route("/api/market/mtf", get(api::market_mtf))
         .route("/api/runs/:run_id", get(api::get_run))
         .route("/api/runs/:run_id/cancel", post(api::cancel_run))
         .route("/api/events", get(api::list_events).post(api::ingest_event))
         .route("/api/skills", get(api::list_skills))
         .route("/api/skills/reload", post(api::reload_skills))
-        .route("/api/skills/:name", get(api::get_skill).put(api::save_skill))
+        .route("/api/skills/import", post(api::import_skills))
+        .route("/api/skills/:name", get(api::get_skill).put(api::save_skill).delete(api::delete_skill))
         .route("/api/settings", get(api::get_settings).put(api::put_settings))
         .route("/api/providers", get(api::list_providers))
         .route("/ws", get(events::websocket_handler))
@@ -98,7 +107,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|error| panic!("Could not bind port {port}: {error}"));
-    tracing::info!("GodView API listening on http://localhost:{port}");
-    axum::serve(listener, app).await.expect("GodView API stopped unexpectedly");
+    let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), port)).await.unwrap_or_else(|error| panic!("Could not bind port {port}: {error}"));
+    tracing::info!("View Engine API listening on http://localhost:{port}");
+    axum::serve(listener, app).await.expect("View Engine API stopped unexpectedly");
 }

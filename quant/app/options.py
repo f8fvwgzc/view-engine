@@ -11,7 +11,7 @@ import pandas as pd
 from scipy.stats import norm
 
 from .cache import TTL_OPTIONS, cache
-from .data import DataError, get_price, iso, price_for_ticker
+from .data import DataError, get_price, iso, price_for_ticker, replay_as_of
 from .symbols import OptionsProxy, Symbol
 
 RISK_FREE = 0.04  # flat assumption for Black-Scholes gamma
@@ -173,6 +173,8 @@ def _expiries(ticker: str) -> list[str]:
 
 
 def get_options(sym: Symbol, n_expiries: int = 3) -> dict:
+    if replay_as_of() is not None:
+        raise DataError("option chains are only available live (no free historical chains) — omitted in replay")
     ticker = sym.options_ticker
     if not ticker:
         raise DataError(f"{sym.id} has no listed options or options proxy")

@@ -70,28 +70,52 @@ impl Quant {
         best.map(|(_, id)| id)
     }
 
-    pub async fn snapshot(&self, symbol: &str, timeframes: &[String], horizon: &str) -> Result<Value, String> {
-        self.get("/snapshot", &[("symbol", symbol.to_string()), ("timeframes", timeframes.join(",")), ("horizon", horizon.to_string())], 120).await
+    /// `as_of` (replay mode) restricts every computation to candles closed at or before that moment.
+    pub async fn snapshot(&self, symbol: &str, timeframes: &[String], horizon: &str, as_of: Option<DateTime<Utc>>) -> Result<Value, String> {
+        let mut query = vec![("symbol", symbol.to_string()), ("timeframes", timeframes.join(",")), ("horizon", horizon.to_string())];
+        if let Some(as_of) = as_of { query.push(("as_of", as_of.to_rfc3339())) }
+        self.get("/snapshot", &query, 180).await
     }
 
-    pub async fn price(&self, symbol: &str) -> Option<f64> {
-        self.get("/price", &[("symbol", symbol.to_string())], 20).await.ok()?["price"].as_f64()
+    pub async fn price(&self, symbol: &str, as_of: Option<DateTime<Utc>>) -> Option<f64> {
+        let mut query = vec![("symbol", symbol.to_string())];
+        if let Some(as_of) = as_of { query.push(("as_of", as_of.to_rfc3339())) }
+        self.get("/price", &query, 30).await.ok()?["price"].as_f64()
+    }
+
+    /// Candles (t, high, low, close) between two moments, 15-minute resolution when the sidecar has it.
+    pub async fn path(&self, symbol: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(DateTime<Utc>, f64, f64, f64)> {
+        for interval in ["15m", "1h"] {
+            let query = [("symbol", symbol.to_string()), ("interval", interval.to_string()), ("start", start.to_rfc3339()), ("end", end.to_rfc3339()), ("lookback", "5000".to_string())];
+            if let Ok(value) = self.get("/ohlc", &query, 60).await {
+                let candles = parse_candles(&value);
+                let inside: Vec<_> = candles.into_iter().filter(|(time, ..)| *time >= start && *time <= end).collect();
+                if !inside.is_empty() {
+                    return inside;
+                }
+            }
+        }
+        vec![]
     }
 
     /// Hourly candles (t, high, low, close) for scoring a prediction path.
     pub async fn hourly(&self, symbol: &str, lookback: usize) -> Vec<(DateTime<Utc>, f64, f64, f64)> {
         let Ok(value) = self.get("/ohlc", &[("symbol", symbol.to_string()), ("interval", "1h".into()), ("lookback", lookback.to_string())], 30).await else { return vec![] };
-        value["candles"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|candle| {
-                let time = candle["t"].as_str().and_then(|text| DateTime::parse_from_rfc3339(text).ok()).map(|time| time.with_timezone(&Utc))
-                    .or_else(|| candle["t"].as_i64().and_then(|seconds| DateTime::from_timestamp(if seconds > 10_000_000_000 { seconds / 1000 } else { seconds }, 0)))?;
-                Some((time, candle["h"].as_f64()?, candle["l"].as_f64()?, candle["c"].as_f64()?))
-            })
-            .collect()
+        parse_candles(&value)
     }
+}
+
+fn parse_candles(value: &Value) -> Vec<(DateTime<Utc>, f64, f64, f64)> {
+    value["candles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|candle| {
+            let time = candle["t"].as_str().and_then(|text| DateTime::parse_from_rfc3339(text).ok()).map(|time| time.with_timezone(&Utc))
+                .or_else(|| candle["t"].as_i64().and_then(|seconds| DateTime::from_timestamp(if seconds > 10_000_000_000 { seconds / 1000 } else { seconds }, 0)))?;
+            Some((time, candle["h"].as_f64()?, candle["l"].as_f64()?, candle["c"].as_f64()?))
+        })
+        .collect()
 }
 
 fn normalize(text: &str) -> String {
@@ -111,13 +135,15 @@ pub fn horizon_hours(horizon: &str) -> i32 {
 }
 
 /// Stores the head trader's plan as a scored-later prediction.
-pub async fn record_prediction(database: &PgPool, quant: &Quant, ids: (Uuid, Uuid, Uuid), symbol: &str, plan: &Value, horizon_hours: i32, model_prob_up: Option<f64>) -> Option<Uuid> {
+pub async fn record_prediction(database: &PgPool, quant: &Quant, ids: (Uuid, Uuid, Uuid), symbol: &str, plan: &Value, horizon_hours: i32, model_prob_up: Option<f64>, as_of: Option<DateTime<Utc>>) -> Option<Uuid> {
     let direction = match plan["direction"].as_str().unwrap_or("neutral").to_ascii_lowercase().as_str() {
         "long" | "buy" | "bullish" => "long",
         "short" | "sell" | "bearish" => "short",
         _ => "neutral",
     };
-    let reference = quant.price(symbol).await?;
+    let reference = quant.price(symbol, as_of).await?;
+    // Replay runs are stamped at their as-of moment so they are scored against what actually followed.
+    let created_at = as_of.unwrap_or_else(Utc::now);
     let probability = plan["probability"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
     let horizon = plan["horizon_hours"].as_i64().map(|hours| hours as i32).filter(|hours| *hours > 0).unwrap_or(horizon_hours).clamp(1, 24 * 90);
     let entry = plan["entry_zone"].as_array().map(|zone| zone.iter().filter_map(Value::as_f64).collect::<Vec<_>>()).unwrap_or_default();
@@ -125,8 +151,8 @@ pub async fn record_prediction(database: &PgPool, quant: &Quant, ids: (Uuid, Uui
     let id = Uuid::new_v4();
     let (project_id, task_id, run_id) = ids;
     sqlx::query(
-        "INSERT INTO predictions (id, project_id, task_id, run_id, symbol, direction, probability, horizon_hours, reference_price, entry_low, entry_high, stop, targets, plan, model_prob_up, evaluate_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW() + make_interval(hours => $8))",
+        "INSERT INTO predictions (id, project_id, task_id, run_id, symbol, direction, probability, horizon_hours, reference_price, entry_low, entry_high, stop, targets, plan, model_prob_up, created_at, evaluate_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16 + make_interval(hours => $8))",
     )
     .bind(id)
     .bind(project_id)
@@ -143,6 +169,7 @@ pub async fn record_prediction(database: &PgPool, quant: &Quant, ids: (Uuid, Uui
     .bind(&targets)
     .bind(plan)
     .bind(model_prob_up.map(|value| value as f32))
+    .bind(created_at)
     .execute(database)
     .await
     .ok()?;
@@ -212,52 +239,68 @@ pub fn score(direction: &str, probability: f64, reference: f64, entry: (Option<f
     Some(Score { outcome, price: last_close, return_pct: signed, brier })
 }
 
+/// Scores every prediction whose horizon has passed; returns how many were scored.
+pub async fn score_due(state: &crate::SharedState) -> usize {
+    let due: Vec<DuePrediction> = sqlx::query_as("SELECT id, project_id, task_id, run_id, symbol, direction, probability, horizon_hours, reference_price, entry_low, entry_high, stop, targets, created_at, evaluate_at FROM predictions WHERE evaluated_at IS NULL AND evaluate_at <= NOW() LIMIT 20")
+        .fetch_all(&state.database)
+        .await
+        .unwrap_or_default();
+    let mut scored = 0;
+    for prediction in due {
+        let mut candles = state.harness.quant.path(&prediction.symbol, prediction.created_at, prediction.evaluate_at).await;
+        if candles.is_empty() {
+            candles = state.harness.quant.hourly(&prediction.symbol, (prediction.horizon_hours as usize + 72).min(2000)).await.into_iter().filter(|(time, ..)| *time >= prediction.created_at && *time <= prediction.evaluate_at).collect();
+        }
+        let path: Vec<(f64, f64, f64)> = candles.into_iter().map(|(_, high, low, close)| (high, low, close)).collect();
+        let result = score(&prediction.direction, prediction.probability as f64, prediction.reference_price, (prediction.entry_low, prediction.entry_high), prediction.stop, prediction.targets.first().copied(), &path);
+        let Some(result) = result else {
+            // No data yet (weekend / feed gap): retry later, give up a week after the horizon.
+            if Utc::now() - prediction.evaluate_at > chrono::Duration::days(7) {
+                let _ = sqlx::query("UPDATE predictions SET evaluated_at = NOW(), outcome = 'unscored' WHERE id = $1").bind(prediction.id).execute(&state.database).await;
+            }
+            continue;
+        };
+        scored += 1;
+        let _ = sqlx::query("UPDATE predictions SET evaluated_at = NOW(), outcome = $2, outcome_price = $3, return_pct = $4, brier = $5 WHERE id = $1")
+            .bind(prediction.id)
+            .bind(result.outcome)
+            .bind(result.price)
+            .bind(result.return_pct)
+            .bind(result.brier)
+            .execute(&state.database)
+            .await;
+        // Credit (or debit) the skills that took part in the run that made this call.
+        let hit = matches!((prediction.direction.as_str(), result.outcome), (_, "target") | ("neutral", "flat"));
+        let column = if hit { "hits" } else { "misses" };
+        let _ = sqlx::query(&format!("UPDATE skill_stats SET {column} = {column} + 1, updated_at = NOW() WHERE skill IN (SELECT DISTINCT unnest(skills) FROM run_agents WHERE run_id = $1)")).bind(prediction.run_id).execute(&state.database).await;
+        state.harness.refresh_skill_priors().await;
+        let message = format!(
+            "Prediction scored: {} {} from {:.5} ({}) with {:.0}% → {} ({:+.2}% in {}h, Brier {:.3})",
+            prediction.symbol, prediction.direction, prediction.reference_price, prediction.created_at.format("%Y-%m-%d %H:%M UTC"), prediction.probability * 100.0, result.outcome, result.return_pct, prediction.horizon_hours, result.brier
+        );
+        crate::events::EventDraft::new(prediction.project_id, prediction.task_id, prediction.run_id, "prediction_scored", message.clone())
+            .from("orchestrator")
+            .data(json!({"prediction_id": prediction.id, "outcome": result.outcome, "return_pct": result.return_pct, "brier": result.brier}))
+            .publish(state)
+            .await;
+        let scope = super::memory::Scope { project_id: prediction.project_id, task_id: Some(prediction.task_id), run_id: Some(prediction.run_id), agent_key: Some("evaluator".into()) };
+        super::memory::retain(&state.harness, &scope, vec![super::memory::NewMemory {
+            kind: "experience".into(),
+            content: format!("{message} (scored {}).", Utc::now().format("%Y-%m-%d")),
+            entities: vec![prediction.symbol.clone()],
+            source_url: None,
+            importance: 0.8,
+            confidence: Some(1.0),
+        }]).await;
+    }
+    scored
+}
+
 /// Background loop: scores predictions whose horizon has passed and reports them as events + memory.
 pub async fn evaluator(state: crate::SharedState) {
     loop {
         tokio::time::sleep(Duration::from_secs(300)).await;
-        let due: Vec<DuePrediction> = sqlx::query_as("SELECT id, project_id, task_id, run_id, symbol, direction, probability, horizon_hours, reference_price, entry_low, entry_high, stop, targets, created_at, evaluate_at FROM predictions WHERE evaluated_at IS NULL AND evaluate_at <= NOW() LIMIT 20")
-            .fetch_all(&state.database)
-            .await
-            .unwrap_or_default();
-        for prediction in due {
-            let candles = state.harness.quant.hourly(&prediction.symbol, (prediction.horizon_hours as usize + 72).min(2000)).await;
-            let path: Vec<(f64, f64, f64)> = candles.into_iter().filter(|(time, ..)| *time >= prediction.created_at && *time <= prediction.evaluate_at).map(|(_, high, low, close)| (high, low, close)).collect();
-            let result = score(&prediction.direction, prediction.probability as f64, prediction.reference_price, (prediction.entry_low, prediction.entry_high), prediction.stop, prediction.targets.first().copied(), &path);
-            let Some(result) = result else {
-                // No data yet (weekend / feed gap): retry later, give up after a week.
-                if Utc::now() - prediction.evaluate_at > chrono::Duration::days(7) {
-                    let _ = sqlx::query("UPDATE predictions SET evaluated_at = NOW(), outcome = 'unscored' WHERE id = $1").bind(prediction.id).execute(&state.database).await;
-                }
-                continue;
-            };
-            let _ = sqlx::query("UPDATE predictions SET evaluated_at = NOW(), outcome = $2, outcome_price = $3, return_pct = $4, brier = $5 WHERE id = $1")
-                .bind(prediction.id)
-                .bind(result.outcome)
-                .bind(result.price)
-                .bind(result.return_pct)
-                .bind(result.brier)
-                .execute(&state.database)
-                .await;
-            let message = format!(
-                "Prediction scored: {} {} at {:.5} with {:.0}% → {} ({:+.2}% in {}h, Brier {:.3})",
-                prediction.symbol, prediction.direction, prediction.reference_price, prediction.probability * 100.0, result.outcome, result.return_pct, prediction.horizon_hours, result.brier
-            );
-            crate::events::EventDraft::new(prediction.project_id, prediction.task_id, prediction.run_id, "prediction_scored", message.clone())
-                .from("orchestrator")
-                .data(json!({"prediction_id": prediction.id, "outcome": result.outcome, "return_pct": result.return_pct, "brier": result.brier}))
-                .publish(&state)
-                .await;
-            let scope = super::memory::Scope { project_id: prediction.project_id, task_id: Some(prediction.task_id), run_id: Some(prediction.run_id), agent_key: Some("evaluator".into()) };
-            super::memory::retain(&state.harness, &scope, vec![super::memory::NewMemory {
-                kind: "experience".into(),
-                content: format!("{message} (scored {}).", Utc::now().format("%Y-%m-%d")),
-                entities: vec![prediction.symbol.clone()],
-                source_url: None,
-                importance: 0.8,
-                confidence: Some(1.0),
-            }]).await;
-        }
+        score_due(&state).await;
     }
 }
 
@@ -307,6 +350,45 @@ mod tests {
 }
 
 impl Quant {
+    /// Retest lab: break → retest → continue entries with fixed-pip stops/targets, wick-depth statistics and a
+    /// stop/target grid. Query parameters are passed through to the sidecar.
+    pub async fn retest(&self, params: &[(String, String)]) -> Result<Value, String> {
+        let query: Vec<(&str, String)> = params.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+        self.get("/retest", &query, 240).await
+    }
+
+    /// Session story: how each recent session behaved, where price is now relative to the body-level lines,
+    /// and the next if-then triggers for the fixed-pip day-trade model.
+    pub async fn session_story(&self, symbol: &str, interval: &str, pip: Option<f64>, sl_pips: f64, tp_pips: f64, as_of: Option<DateTime<Utc>>) -> Result<Value, String> {
+        let mut query = vec![("symbol", symbol.to_string()), ("interval", interval.to_string()), ("days", "3".to_string()), ("sl_pips", sl_pips.to_string()), ("tp_pips", tp_pips.to_string())];
+        if let Some(pip) = pip {
+            query.push(("pip", pip.to_string()));
+        }
+        if let Some(as_of) = as_of {
+            query.push(("as_of", as_of.to_rfc3339()));
+        }
+        self.get("/session-story", &query, 180).await
+    }
+
+    /// Level reactions: body-level zones across timeframes, every touch classified (rejection, sweep, break,
+    /// retest), zone strength, hold-vs-break odds and the M15 → H1 → H4 stack. Parameters pass through.
+    pub async fn levels(&self, params: &[(String, String)]) -> Result<Value, String> {
+        let query: Vec<(&str, String)> = params.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+        self.get("/levels", &query, 240).await
+    }
+
+    /// Top-down read: per timeframe consolidation box or impulse, wick sweeps that failed to close beyond, and
+    /// the playbook that follows (sell zone / buy zone inside a range, retest zone after a close-confirmed break).
+    pub async fn mtf(&self, params: &[(String, String)]) -> Result<Value, String> {
+        let query: Vec<(&str, String)> = params.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+        self.get("/mtf", &query, 240).await
+    }
+
+    /// Backtest of the body-close structure rules over the available history (can take a few seconds).
+    pub async fn backtest(&self, symbol: &str, interval: &str) -> Result<Value, String> {
+        self.get("/backtest", &[("symbol", symbol.to_string()), ("interval", interval.to_string())], 180).await
+    }
+
     pub async fn signals(&self, symbol: &str, intervals: &[String]) -> Result<Value, String> {
         self.get("/signals", &[("symbol", symbol.to_string()), ("intervals", intervals.join(","))], 60).await
     }

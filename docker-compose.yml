@@ -1,22 +1,24 @@
-# Infrastructure for GodView Engine. For the full research harness (Claude Code / Codex / Copilot CLIs on your
+# Infrastructure for View Engine. For the full research harness (Claude Code / Codex / Copilot CLIs on your
 # own subscriptions) run the backend on the host: `make dev`. The `backend` and `frontend` services below are
 # for container-only setups that use Ollama, an OpenAI-compatible server or the simulated provider.
+name: view-engine
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: godview
-      POSTGRES_USER: godview
-      POSTGRES_PASSWORD: godview
+      POSTGRES_DB: viewengine
+      POSTGRES_USER: viewengine
+      POSTGRES_PASSWORD: viewengine
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U godview -d godview"]
+      test: ["CMD-SHELL", "pg_isready -U viewengine -d viewengine"]
       interval: 3s
       timeout: 3s
       retries: 20
     ports:
       - "${POSTGRES_PORT:-5433}:5432"
     volumes:
-      - godview-postgres:/var/lib/postgresql/data
+      - view-engine-postgres:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
@@ -29,26 +31,29 @@ services:
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - godview-redis:/data
+      - view-engine-redis:/data
 
   backend:
     profiles: ["containers"]
     build: ./backend
     environment:
-      DATABASE_URL: postgres://godview:godview@postgres:5432/godview
+      DATABASE_URL: postgres://viewengine:viewengine@postgres:5432/viewengine
       REDIS_URL: redis://redis:6379
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:1234/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-local-model}
       SKILLS_DIR: /app/skills
+      BIND_ADDR: 0.0.0.0
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     ports:
-      - "3002:3001"
+      - "127.0.0.1:3002:3001"
+    volumes:
+      - ./skills:/app/skills
 
   frontend:
     profiles: ["containers"]
@@ -61,5 +66,5 @@ services:
       - "${FRONTEND_PORT:-5173}:5173"
 
 volumes:
-  godview-postgres:
-  godview-redis:
+  view-engine-postgres:
+  view-engine-redis:

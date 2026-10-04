@@ -167,6 +167,8 @@ def test_h4_bins_ny_aligned_across_dst():
         df = pd.DataFrame({"o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 0.0}, index=idx)
         out = resample_ohlc(df, "4h")
         assert set(out.index.hour) == first_utc_hours
+        metal = resample_ohlc(df, "4h", 2)   # spot metals: grid starts with the 18:00 New York session open
+        assert set(metal.index.hour) == {(x + 1) % 24 for x in first_utc_hours}
 
 
 def test_next_close_skips_weekend():

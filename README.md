@@ -1,4 +1,4 @@
-# GodView Engine
+# View Engine
 
 A local research engine. Create a project, ask a question, and a single **orchestrator** hires a team of
 specialist agents for it, wires them into a dependency graph, lets them research the open web and exchange
@@ -64,8 +64,8 @@ options and tick data need a paid feed; the sidecar's data layer is where such a
 | `orchestrator.rs` | Hiring, DAG validation, scheduler with retry/backoff, agent loop, critic rounds, final decision |
 | `router.rs` | Model router: role → `provider:model`, ordered fallback chain on usage limits / unavailability |
 | `providers.rs` | Adapters: Claude Code CLI (integrated, lean `claude -p` mode), Codex, Copilot, Ollama, OpenAI-compatible, simulated |
-| `skills.rs` + `backend/skills/` | 51 SKILL.md skills (finance, CFA L1–L3, law, medicine, science, aerospace, design, color, brand, platforms…); catalog for hiring, full body only for assigned agents |
-| `memory.rs` | pgvector + full-text hybrid recall fused by RRF, dedup, consolidation into observations |
+| `skills.rs` + `skills/` (yours) | User-owned SKILL.md library: in-memory index (inverted-index BM25 + vector similarity, RRF-fused) shortlists skills for the orchestrator and resolves them per agent without a model call; outcome stats nudge ranking; GitHub import |
+| `memory.rs` | Always-on long-term memory: pgvector + full-text hybrid recall fused by RRF, dedup, consolidation into observations |
 | `compress.rs` | HTML→text, dense-line elision, BM25 extractive compression, `never_worse` |
 | `ledger.rs` | Token accounting (input/output/cache read/write, tokens saved) and content-addressed response cache |
 | `web.rs` | Search/fetch for providers without native browsing (DuckDuckGo, Wikipedia, optional SearXNG), cached |
@@ -76,12 +76,27 @@ system prompt is byte-identical across agents so the provider prompt cache is re
 
 Codex, Copilot, Ollama and OpenAI-compatible adapters are implemented but not yet exercised end to end.
 
+## Skills
+
+View Engine ships **without** skills. Your library lives in `skills/` (git-ignored): write skills in
+Settings → Skills, drop `skills/<name>/SKILL.md` folders in, or import packs from public GitHub repos
+(e.g. `anthropics/skills`). See [skills/README.md](skills/README.md). Agents run fine with an empty library.
+
+## Proof, not just predictions
+
+- **Backtest** (CALLS → watchlist → interval button): the body-close structure rules replayed over history with
+  costs — win rate vs breakeven with a confidence interval, expectancy in R, breakdowns by session and signal.
+  A verdict of *edge* needs the interval to clear breakeven, positive expectancy and ≥100 trades.
+- **Scored calls**: every trade plan is checked against the market after its horizon (hit rate, Brier).
+- **Skill stats**: each skill's uses and outcomes (critic verdicts, scored calls) feed its ranking.
+
 ## Configuration
 
-Settings (UI → gear icon) hold run defaults, the model router and the skill library (add/edit skills there or
-drop folders into `backend/skills/`). Backend env vars: `CLAUDE_BIN`, `CLAUDE_MODEL`, `CODEX_BIN`,
+Settings (UI → gear icon) hold run defaults, the model router, the skill library and appearance (fonts, text
+size, accent colour, header and panel sizes — stored per browser). Backend env vars: `CLAUDE_BIN`, `CLAUDE_MODEL`, `CODEX_BIN`,
 `CODEX_MODEL`, `COPILOT_BIN`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OPENAI_BASE_URL`, `OPENAI_MODEL`,
-`OPENAI_API_KEY`, `SEARXNG_URL`, `SKILLS_DIR`, `GODVIEW_WORKDIR`. With Ollama's `nomic-embed-text` pulled,
+`OPENAI_API_KEY`, `SEARXNG_URL`, `SKILLS_DIR`, `VIEW_ENGINE_WORKDIR`, `BIND_ADDR` (default `127.0.0.1`; the API has no
+authentication, keep it local). With Ollama's `nomic-embed-text` pulled,
 memory uses semantic embeddings; otherwise a local hashing embedder is used.
 
 `POST /api/events` accepts external events (scripts, hooks) into the live stream.

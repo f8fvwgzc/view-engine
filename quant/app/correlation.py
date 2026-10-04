@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 
-from .data import DataError, get_series
+from .data import DataError, get_series, submit_ctx
 from .symbols import Symbol
 
 REGIME_CHANGE_THRESHOLD = 0.3
@@ -51,7 +51,7 @@ def correlation_report(symbols: list[Symbol], interval: str = "1d", window: int 
         return s, get_series(s, interval)
 
     with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = [ex.submit(load, s) for s in symbols]
+        futs = [submit_ctx(ex, load, s) for s in symbols]
         for f, s in zip(futs, symbols):
             try:
                 _, ser = f.result()
