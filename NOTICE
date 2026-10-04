@@ -1,0 +1,29 @@
+GodView Engine
+Copyright (c) the GodView Engine contributors. Licensed under the MIT License (see LICENSE).
+
+This product ports patterns, algorithms, constants and, where noted in source headers, small code snippets
+from the following open-source projects. Their licenses and notices apply to the derived portions.
+
+- texc-symphony (https://github.com/f8fvwgzc/texc-symphony) — Apache License 2.0.
+  A Rust port of openai/symphony. Retry/backoff scheduling (`retry_delay`, continuation vs failure delays),
+  stall handling and scheduler shape: backend/src/harness/retry.rs, backend/src/harness/orchestrator.rs.
+- openai/symphony (https://github.com/openai/symphony) — Apache License 2.0, Copyright 2025 OpenAI.
+  Orchestrator tick loop, concurrency limits, retry semantics.
+- openai/codex (https://github.com/openai/codex) — Apache License 2.0.
+  Jittered in-call backoff, retryable vs terminal error classification, compaction approach for continuations.
+- headroomlabs-ai/headroom (https://github.com/headroomlabs-ai/headroom) — Apache License 2.0.
+  Token estimation ratios, dense-line elision, run collapsing, BM25/segment-based extractive compression,
+  cache-stable prompt ordering: backend/src/harness/compress.rs, backend/src/harness/ledger.rs, prompts.rs.
+- rtk-ai/rtk (https://github.com/rtk-ai/rtk) — Apache License 2.0.
+  `never_worse` guard, repeated-line counting, savings accounting: backend/src/harness/compress.rs, ledger.rs.
+- vectorize-io/hindsight (https://github.com/vectorize-io/hindsight) — MIT License, Copyright 2025 Vectorize AI, Inc.
+  Memory kinds, entity signals in the lexical arm, RRF fusion with bounded boosts, budgeted packing,
+  consolidation into observations: backend/src/harness/memory.rs, migrations/0004_research_harness.sql.
+- mem0ai/mem0 (https://github.com/mem0ai/mem0) — Apache License 2.0.
+  Content-hash dedup, integer-id mapping when showing memories to a model: backend/src/harness/memory.rs.
+- paperclipai/paperclip (https://github.com/paperclipai/paperclip) — MIT License, Copyright (c) 2025 Paperclip AI.
+  Orchestrator-hires-agents model (org chart, skills at hire, validation), CLI adapter argument/output shapes,
+  error families, compact results flowing up, execution contract: backend/src/harness/orchestrator.rs,
+  providers.rs, prompts.rs, skills.rs.
+- pgvector/pgvector (https://github.com/pgvector/pgvector) — PostgreSQL License.
+  Hybrid search query shape (materialised ANN CTE, iterative scan).

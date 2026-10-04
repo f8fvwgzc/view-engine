@@ -1,3 +1,6 @@
+# Infrastructure for GodView Engine. For the full research harness (Claude Code / Codex / Copilot CLIs on your
+# own subscriptions) run the backend on the host: `make dev`. The `backend` and `frontend` services below are
+# for container-only setups that use Ollama, an OpenAI-compatible server or the simulated provider.
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -11,7 +14,7 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - godview-postgres:/var/lib/postgresql/data
 
@@ -24,21 +27,21 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - godview-redis:/data
 
   backend:
+    profiles: ["containers"]
     build: ./backend
     environment:
       DATABASE_URL: postgres://godview:godview@postgres:5432/godview
       REDIS_URL: redis://redis:6379
-      AGENT_PROVIDER: ${AGENT_PROVIDER:-ollama}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:E4B}
-      CODEX_APP_SERVER_URL: ${CODEX_APP_SERVER_URL:-ws://codex-app-server:4500}
-      CODEX_APP_SERVER_TOKEN_FILE: /run/codex/token
-      CODEX_WORKSPACE: ${CODEX_WORKSPACE:-/workspace}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:1234/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-local-model}
+      SKILLS_DIR: /app/skills
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,44 +49,17 @@ services:
         condition: service_healthy
     ports:
       - "3002:3001"
-    volumes:
-      - ${CODEX_TRANSPORT_VOLUME:-codex-transport}:/run/codex:ro
-
-  codex-app-server:
-    profiles: ["codex"]
-    build: ./codex-app-server
-    environment:
-      CODEX_HOME: /root/.codex
-      CODEX_CA_CERTIFICATE: /certs/host-roots.pem
-    volumes:
-      - ${HOME}/.codex:/root/.codex
-      - ./:/workspace
-      - ${CODEX_TRANSPORT_VOLUME:-codex-transport}:/run/codex
-      - /private/tmp/godview-host-roots.pem:/certs/host-roots.pem:ro
-    expose:
-      - "4500"
-    command:
-      - /bin/sh
-      - -lc
-      - >-
-        if [ ! -s /run/codex/token ]; then umask 077; node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))" > /run/codex/token; fi; chmod 600 /run/codex/token;
-        exec codex app-server --listen ws://0.0.0.0:4500 --ws-auth capability-token --ws-token-file /run/codex/token
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4500/readyz').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
-      interval: 5s
-      timeout: 3s
-      retries: 20
 
   frontend:
+    profiles: ["containers"]
     build: ./frontend
     depends_on:
       - backend
     environment:
       VITE_PROXY_TARGET: http://backend:3001
     ports:
-      - "5173:5173"
+      - "${FRONTEND_PORT:-5173}:5173"
 
 volumes:
   godview-postgres:
   godview-redis:
-  codex-transport:

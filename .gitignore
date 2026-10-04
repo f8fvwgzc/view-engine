@@ -19,3 +19,9 @@ token
 # logs and OS files
 *.log
 .DS_Store
+
+# quant sidecar
+quant/.venv
+quant/.cache
+__pycache__/
+.pytest_cache/

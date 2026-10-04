@@ -1,106 +1,90 @@
 # GodView Engine
 
-A local-first agent orchestration dashboard: create projects, add tasks, select agents, then watch a five-agent swarm coordinate in real time.
+A local research engine. Create a project, ask a question, and a single **orchestrator** hires a team of
+specialist agents for it, wires them into a dependency graph, lets them research the open web and exchange
+findings, and returns a **decision-ready strategy** with sources. You watch the team being born, talking and
+leaving in real time.
 
-## Run locally
+No credits, no API billing: agents run on **your own CLI subscriptions** (Claude Code, Codex, GitHub Copilot)
+or on local models (Ollama, any OpenAI-compatible server). Efficiency features — prompt caching, compression,
+memory — exist so those subscription limits go further.
 
-Start the complete stack:
+## Run it
 
-```bash
-docker compose up --build
-```
-
-Open `http://localhost:5173`. The Docker API is on `http://localhost:3002`, Postgres on `localhost:5432`, and Redis on `localhost:6379`. The frontend proxies API and WebSocket traffic automatically.
-
-For local development outside Docker, start Postgres and Redis first:
-
-```bash
-docker compose up postgres redis
-```
-
-Then open two more terminals:
+Requirements: Docker, Rust, Node 22+, and at least one provider (e.g. `claude` logged in).
 
 ```bash
-cd backend && cargo run
+make dev
 ```
 
-```bash
-cd frontend && npm_config_cache=/tmp/godview-engine-npm-cache npm install && npm run dev
-```
+This starts Postgres (pgvector, host port 5433) and Redis in Docker, then the API on `http://localhost:3001`,
+the UI on `http://localhost:5173` and the quant sidecar on `http://127.0.0.1:8090` on your machine (needs `uv`). The API runs on the host so it can launch your CLIs.
+URLs are shareable: `?project=…&task=…&agent=…`.
 
-No authentication or API keys are required for the dashboard itself.
+Other targets: `make test`, `make containers` (everything in Docker; Ollama/OpenAI-compatible/simulated only).
 
-## Local Ollama workers
+## How a run works
 
-Ollama is the default agent provider. With your installed `gemma4:E4B` model,
-start the stack with:
+1. **Orchestrator** (the only agent at birth) recalls project memory, reads the skill catalog and hires a team:
+   intent analyst → parallel domain researchers → analysts → strategist → critic. Each agent gets a role,
+   an objective, 0–3 SKILL.md skills, a manager (`reports_to`) and its dependencies.
+2. **Graph execution**: agents start when their dependencies finish (concurrency-limited), receive compact
+   reports from upstream agents, browse the web, and iterate (`continue`/`done`) within their iteration limit.
+   Agents may request extra specialists mid-run; the orchestrator validates and wires them in.
+3. **Critic loop**: the critic can send the team back for a bounded follow-up round with new specialists and a
+   revised strategist.
+4. **Decision**: recommendation, confidence, scored options, flip conditions, next actions, full report, sources.
+5. **Memory**: findings and the decision are stored, deduplicated, and consolidated into long-term observations
+   that the next run in the same project recalls.
 
-```bash
-make up-ollama
-```
+## Trading desk mode
 
-The backend calls `http://host.docker.internal:11434` from Docker, which reaches
-your local Ollama server without publishing it to the browser. The orchestrator
-uses Gemma to select roles and every selected worker uses Gemma for its report.
-Set `OLLAMA_MODEL` or `OLLAMA_URL` before running Compose to change the model or
-server.
+Create a task with **Trading desk** selected, name an instrument (USDJPY, EURUSD, XAUUSD, DXY, SPY…) or let the
+desk detect it, pick a horizon and optional timeframes, and drop/paste chart screenshots.
 
-## Real Codex workers
+1. The quant sidecar (`quant/`, `make quant`, port 8090) builds a **market data pack** from free sources: OHLC for
+   every timeframe (Yahoo/Stooq), indicators and support/resistance zones, cross-asset correlations (DXY, yields,
+   JPY, gold, equities), the ForexFactory economic calendar, trading sessions, options positioning from ETF option
+   chains (OI walls, put/call, max pain, approximate dealer gamma — FXY/GLD/UUP/SPY proxies, ~15 min delayed) and
+   a LightGBM model's P(up) + expected range with walk-forward validation.
+2. The orchestrator hires a desk: chart reader (reads your screenshots), macro & calendar, news impact,
+   correlation, options positioning, quant/ML, risk manager, head trader, critic.
+3. The head trader returns a **trade plan** (direction, calibrated probability, entry zone, stop, targets, timing,
+   key events, scenarios, invalidation).
+4. Every plan is recorded and **scored automatically** after its horizon (target/stop/direction, Brier score);
+   results show under CALLS and feed long-term memory, so the desk learns what worked.
 
-The secure recommended local setup is a host-side Codex app-server with Docker
-only connecting to it through `host.docker.internal`. The browser never reaches
-the app-server and the capability token stays in `/private/tmp`.
+Outputs are probabilities with a measured track record, not guarantees or financial advice. Realtime CME/OTC FX
+options and tick data need a paid feed; the sidecar's data layer is where such adapters plug in.
 
-```bash
-make up-host-codex
-```
+## Engine pieces (`backend/src/harness`)
 
-Open `http://localhost:5173`, create a task, and dispatch it. The hidden
-orchestrator uses Codex to select workers; each selected visible worker receives
-its own isolated Codex thread. Its live response appears in the event stream and
-the combined result appears under **Swarm Result** when the task finishes.
+| Module | What it does |
+|---|---|
+| `orchestrator.rs` | Hiring, DAG validation, scheduler with retry/backoff, agent loop, critic rounds, final decision |
+| `router.rs` | Model router: role → `provider:model`, ordered fallback chain on usage limits / unavailability |
+| `providers.rs` | Adapters: Claude Code CLI (integrated, lean `claude -p` mode), Codex, Copilot, Ollama, OpenAI-compatible, simulated |
+| `skills.rs` + `backend/skills/` | 51 SKILL.md skills (finance, CFA L1–L3, law, medicine, science, aerospace, design, color, brand, platforms…); catalog for hiring, full body only for assigned agents |
+| `memory.rs` | pgvector + full-text hybrid recall fused by RRF, dedup, consolidation into observations |
+| `compress.rs` | HTML→text, dense-line elision, BM25 extractive compression, `never_worse` |
+| `ledger.rs` | Token accounting (input/output/cache read/write, tokens saved) and content-addressed response cache |
+| `web.rs` | Search/fetch for providers without native browsing (DuckDuckGo, Wikipedia, optional SearXNG), cached |
 
-Useful commands:
+Claude Code calls run with `--strict-mcp-config --setting-sources "" --system-prompt-file …` and only the
+WebSearch/WebFetch tools, which cut the fixed context per call from ~33k to a few hundred tokens. The shared
+system prompt is byte-identical across agents so the provider prompt cache is reused within a run.
 
-```bash
-make codex-status
-make codex-logs
-make down-host-codex
-```
+Codex, Copilot, Ollama and OpenAI-compatible adapters are implemented but not yet exercised end to end.
 
-`make up-host-codex` binds the host app-server on port `4500` with a generated
-capability token. Do not publish that port outside your private machine or
-connect the frontend to it directly.
+## Configuration
 
-## What is included
+Settings (UI → gear icon) hold run defaults, the model router and the skill library (add/edit skills there or
+drop folders into `backend/skills/`). Backend env vars: `CLAUDE_BIN`, `CLAUDE_MODEL`, `CODEX_BIN`,
+`CODEX_MODEL`, `COPILOT_BIN`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OPENAI_BASE_URL`, `OPENAI_MODEL`,
+`OPENAI_API_KEY`, `SEARXNG_URL`, `SKILLS_DIR`, `GODVIEW_WORKDIR`. With Ollama's `nomic-embed-text` pulled,
+memory uses semantic embeddings; otherwise a local hashing embedder is used.
 
-- Axum API backed by Postgres; the first migration enables pgvector and creates the project, task, agent, and event tables.
-- Five visible agents: one orchestrator plus planner, researcher, builder, and reviewer.
-- Create a project and task, then dispatch it. The orchestrator reads the task brief, selects the relevant workers, and reveals each node as it dispatches that worker. Selected agents then work concurrently and exchange live cross-agent messages.
-- Redis pub/sub relays every event to WebSocket clients, including the live event stream, agent-state refreshes, and browser notifications.
-- The God View draws active dotted connections and moving light pulses for recent agent-to-agent messages. Select a completed task to read its persisted **Swarm Result** in the task inspector.
-- `POST /api/events` accepts external events, which makes the UI ready for a separate LangGraph worker.
+`POST /api/events` accepts external events (scripts, hooks) into the live stream.
 
-## LangGraph connection
-
-LangGraph can run as a separate worker. Keep this Rust service as the source of truth for projects, tasks, agents, and the UI, then have every LangGraph node/tool `POST` an event to `http://localhost:3001/api/events` using the `SwarmEvent` JSON shape in `backend/src/main.rs`. Redis broadcasts it to every dashboard immediately and Postgres keeps the event history.
-
-This project intentionally contains no Playwright tests or Rust test modules. Before exposing it publicly, add authentication and replace the local Docker credentials.
-
-Project - Task runner Agents
-
-Assigned tasks when start, god view engine tab side can see the how many agents working on that project/task and how exactly result comes? Employee/high role employees can see that agents running process
-
-The tasks sequenced while - scheduler/worker/decider-task agent handle that whole project inside initially runs configure
-Or the tasks not sequence is approved by PM, and during that sequenced tasks can modify able by Employee
-Tasks can create in during project sprint process and tasks can extend the next sprint to move
-And all tasks can just store in database is correct I hope or somewhere in store redis etc.
-
-The orchestrator agent can decide the each agents behind work LLM/Codex - AI can multiple to configure
-And all agents running results or that referring documentations/internet knowledges real time to scale the project knowledge.
-
-Project - conversation page from that employees can realized demand create able /create-demand “demand name” and “realized process”
-This employee created demands directly send to the High Role Employee that project handling and the project tab inside again decision tab create only for PM/ High Role Employee
-And there HREmployee can approval that employees created demands and agents asking approvals for the each project
-
-And Task assigned to Agent while agent directly ask to PM/High Role Employee for that project decision tab in agent want to start assigned “this named task” like approval asking and HREmployee can approve that. But assigned after immediately Agent run and what agent can do in this task something like steps explained and send to the approval to HREmployee. HighRoleEmployee can read and agent to set approval
+Attributions for ported open-source patterns are in [NOTICE](NOTICE). Add authentication before exposing this
+beyond your machine.

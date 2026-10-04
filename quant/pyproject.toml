@@ -1,0 +1,27 @@
+[project]
+name = "godview-quant"
+version = "0.1.0"
+description = "Market-data, quant and ML sidecar for the GodView Engine (analysis tool, not financial advice)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "lightgbm>=4.3",
+    "yfinance>=0.2.50",
+    "scikit-learn>=1.9.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false

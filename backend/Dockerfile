@@ -9,6 +9,7 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim
 RUN useradd --create-home appuser
 COPY --from=builder /app/target/release/godview-api /usr/local/bin/godview-api
+COPY skills /app/skills
 USER appuser
 EXPOSE 3001
 CMD ["godview-api"]

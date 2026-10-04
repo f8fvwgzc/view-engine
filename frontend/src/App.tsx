@@ -1,103 +1,157 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
-import { Activity, BellRing, Bot, ChevronRight, CircleDot, FolderPlus, Play, Plus, Radio, X } from 'lucide-react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { BellRing, Brain, ChevronRight, Crosshair, CircleDot, FolderPlus, Radio, Settings as SettingsIcon, Trash2, X } from 'lucide-react'
+import { api } from './api'
+import { MemoryPanel } from './components/MemoryPanel'
+import { TaskPanel } from './components/TaskPanel'
+import { PredictionsPanel } from './components/Trading'
+import { timeLabel, type PredictionBook, type Project, type Provider, type RunDetail, type Settings, type SwarmEvent, type TaskConfig } from './types'
+import { useLiveEvents } from './useLiveEvents'
+import { useUrlSelection } from './useUrlSelection'
 
-const API = import.meta.env.VITE_API_URL ?? ''
-const websocketUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
+// Code-split the heavy parts: the graph (React Flow) and the modals load on first use.
+const GodView = lazy(() => import('./GodView').then((module) => ({ default: module.GodView })))
+const ProjectModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.ProjectModal })))
+const TaskModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.TaskModal })))
+const SettingsModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.SettingsModal })))
+const ReportModal = lazy(() => import('./components/Modals').then((module) => ({ default: module.ReportModal })))
 
-type AgentStatus = 'idle' | 'working' | 'waiting' | 'complete' | 'error'
-type TaskStatus = 'draft' | 'ready' | 'running' | 'complete' | 'failed'
+const MAX_EVENTS = 300
+const MAX_NOTIFICATIONS = 2
+// Toasts only for run milestones of tasks you are not looking at; the selected run already shows in the graph.
+const NOTIFY_KINDS = new Set(['run_complete', 'run_failed', 'round_started'])
 
-type Agent = { id: string; name: string; role: string; description: string; status: AgentStatus; active_task_id: string | null; x: number; y: number }
-type Task = { id: string; title: string; description: string; assigned_agent_ids: string[]; status: TaskStatus; result: string | null; completed_at: string | null; run_started_at: string | null; created_at: string }
-type Project = { id: string; name: string; description: string; created_at: string; tasks: Task[] }
-type SwarmEvent = { id: string; project_id: string; task_id: string | null; kind: string; message: string; from_agent_id: string | null; to_agent_id: string | null; created_at: string }
-type Dashboard = { projects: Project[]; agents: Agent[]; events: SwarmEvent[] }
-type Notification = Pick<SwarmEvent, 'id' | 'kind' | 'message' | 'from_agent_id' | 'to_agent_id'>
-
-const agentLinks = [
-  ['orchestrator', 'planner'], ['orchestrator', 'researcher'], ['orchestrator', 'builder'], ['orchestrator', 'reviewer'],
-  ['planner', 'researcher'], ['planner', 'builder'], ['planner', 'reviewer'],
-  ['researcher', 'planner'], ['researcher', 'builder'], ['researcher', 'reviewer'],
-  ['builder', 'planner'], ['builder', 'researcher'], ['builder', 'reviewer'],
-  ['reviewer', 'planner'], ['reviewer', 'builder'], ['reviewer', 'orchestrator'],
-]
-
-function statusLabel(status: string) { return status === 'idle' ? 'STANDBY' : status.toUpperCase() }
-function timeLabel(iso: string) { return new Date(iso).toLocaleTimeString([], { hour12: false, second: '2-digit' }) }
+type Notification = Pick<SwarmEvent, 'id' | 'kind' | 'message'>
 
 export function App() {
   const [projects, setProjects] = useState<Project[]>([])
-  const [agents, setAgents] = useState<Agent[]>([])
   const [events, setEvents] = useState<SwarmEvent[]>([])
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
-  const [showProjectForm, setShowProjectForm] = useState(false)
-  const [showTaskForm, setShowTaskForm] = useState(false)
-  const [connected, setConnected] = useState(false)
-  const [refreshing, setRefreshing] = useState(false)
+  const [skillCount, setSkillCount] = useState(0)
+  const { project: selectedProjectId, task: selectedTaskId, agent: selectedAgent, selectProject, selectTask: setSelectedTaskId, selectAgent: setSelectedAgent } = useUrlSelection()
+  const [detail, setDetail] = useState<RunDetail | null>(null)
+  const [leftTab, setLeftTab] = useState<'stream' | 'memory' | 'predictions'>('stream')
+  const [book, setBook] = useState<PredictionBook | null>(null)
+  const [memoryKey, setMemoryKey] = useState(0)
+  const [bookKey, setBookKey] = useState(0)
+  const [modal, setModal] = useState<'project' | 'task' | 'settings' | 'report' | null>(null)
+  const [providers, setProviders] = useState<Provider[]>([])
+  const [limits, setLimits] = useState<Record<string, { status?: string; resetsAt?: number; rateLimitType?: string }>>({})
+  const [defaults, setDefaults] = useState<Settings | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [notifications, setNotifications] = useState<Notification[]>([])
-  const [clock, setClock] = useState(Date.now())
+  const dashboardTimer = useRef<number | undefined>(undefined)
+  const selectedProjectRef = useRef(selectedProjectId)
+  selectedProjectRef.current = selectedProjectId
+  const runTimer = useRef<number | undefined>(undefined)
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
   const selectedTask = selectedProject?.tasks.find((task) => task.id === selectedTaskId) ?? null
-  const runningAgents = agents.filter((agent) => agent.status === 'working').length
-  const selectedEvents = useMemo(() => events.filter((event) => !selectedProjectId || event.project_id === selectedProjectId), [events, selectedProjectId])
+  const runId = selectedTask?.latest_run_id ?? null
+  const projectEvents = useMemo(() => events.filter((event) => !selectedProjectId || event.project_id === selectedProjectId), [events, selectedProjectId])
+  const agent = detail?.agents.find((item) => item.key === selectedAgent) ?? null
+  const working = detail?.agents.filter((item) => item.status === 'running').length ?? 0
 
-  async function loadDashboard() {
-    setRefreshing(true)
+  const fail = (caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught))
+
+  const loadDashboard = useCallback(async () => {
     try {
-      const dashboard: Dashboard = await fetch(`${API}/api/dashboard`).then((response) => response.json())
+      const dashboard = await api.dashboard()
       setProjects(dashboard.projects)
-      setAgents(dashboard.agents)
-      setEvents(dashboard.events)
-      setSelectedProjectId((current) => current && dashboard.projects.some((project) => project.id === current) ? current : dashboard.projects[0]?.id ?? null)
-    } finally { setRefreshing(false) }
-  }
+      setEvents((current) => {
+        const seen = new Set(dashboard.events.map((event) => event.id))
+        return [...current.filter((event) => !seen.has(event.id)), ...dashboard.events].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, MAX_EVENTS)
+      })
+      setSkillCount(dashboard.skills)
+      if (!dashboard.projects.some((project) => project.id === selectedProjectRef.current)) selectProject(dashboard.projects[0]?.id ?? null)
+      setError(null)
+    } catch (caught) { fail(caught) }
+  }, [selectProject])
 
-  useEffect(() => { void loadDashboard() }, [])
-  useEffect(() => {
-    const interval = window.setInterval(() => setClock(Date.now()), 700)
-    return () => window.clearInterval(interval)
+  const loadRun = useCallback(async (id: string | null) => {
+    if (!id) { setDetail(null); return }
+    try { setDetail(await api.run(id)) } catch (caught) { fail(caught) }
   }, [])
 
-  useEffect(() => {
-    const socket = new WebSocket(websocketUrl)
-    socket.onopen = () => setConnected(true)
-    socket.onclose = () => setConnected(false)
-    socket.onmessage = (message) => {
-      const event: SwarmEvent = JSON.parse(message.data)
-      setEvents((current) => [event, ...current].slice(0, 120))
-      setNotifications((current) => [{ id: event.id, kind: event.kind, message: event.message, from_agent_id: event.from_agent_id, to_agent_id: event.to_agent_id }, ...current.filter((notification) => notification.id !== event.id)].slice(0, 4))
-      window.setTimeout(() => setNotifications((current) => current.filter((notification) => notification.id !== event.id)), 6000)
-      window.setTimeout(() => void loadDashboard(), 40)
+  const scheduleDashboard = useCallback(() => {
+    window.clearTimeout(dashboardTimer.current)
+    dashboardTimer.current = window.setTimeout(() => void loadDashboard(), 600)
+  }, [loadDashboard])
+
+  const connected = useLiveEvents((event) => {
+    setEvents((current) => current.some((item) => item.id === event.id) ? current : [event, ...current].slice(0, MAX_EVENTS))
+    if (event.run_id && event.run_id === runId) {
+      window.clearTimeout(runTimer.current)
+      runTimer.current = window.setTimeout(() => void loadRun(event.run_id), 350)
     }
-    return () => socket.close()
+    if (event.kind === 'memory_retained' || event.kind === 'memory_consolidated') setMemoryKey((value) => value + 1)
+    if (event.kind === 'prediction_recorded' || event.kind === 'prediction_scored') setBookKey((value) => value + 1)
+    // Market signals always notify: they are about timing, the whole point is to see them immediately.
+    if ((NOTIFY_KINDS.has(event.kind) && event.task_id !== selectedTaskId) || event.kind === 'market_signal') {
+      setNotifications((current) => [{ id: event.id, kind: event.kind, message: event.message }, ...current].slice(0, MAX_NOTIFICATIONS))
+      window.setTimeout(() => setNotifications((current) => current.filter((item) => item.id !== event.id)), 7000)
+    }
+    if (['run_started', 'run_complete', 'run_failed', 'agent_hired', 'agent_result'].includes(event.kind)) scheduleDashboard()
+  }, () => { void loadDashboard(); void loadRun(runId) })
+
+  useEffect(() => { void loadDashboard() }, [loadDashboard])
+  useEffect(() => {
+    if (!selectedProjectId) { setBook(null); return }
+    void api.predictions(selectedProjectId).then(setBook).catch(() => setBook(null))
+  }, [selectedProjectId, bookKey])
+  useEffect(() => { void loadRun(runId) }, [runId, loadRun])
+  // A new run of the same task clears agent focus; the first load (e.g. from a shared URL) keeps it.
+  const previousRun = useRef(runId)
+  useEffect(() => {
+    if (previousRun.current && runId && previousRun.current !== runId) setSelectedAgent(null)
+    previousRun.current = runId
+  }, [runId, setSelectedAgent])
+  useEffect(() => {
+    void api.settings().then(setDefaults).catch(() => undefined)
+    // Subscription window status as last reported by the CLI (no money involved: limits are your plan's own).
+    const refresh = () => void api.providers().then((result) => { setProviders(result.providers); setLimits(result.limits ?? {}) }).catch(() => undefined)
+    refresh()
+    const timer = window.setInterval(refresh, 30_000)
+    return () => window.clearInterval(timer)
   }, [])
+  useEffect(() => () => { window.clearTimeout(dashboardTimer.current); window.clearTimeout(runTimer.current) }, [])
 
-  async function createProject(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const form = new FormData(event.currentTarget)
-    const project = await fetch(`${API}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.get('name'), description: form.get('description') }) }).then((response) => response.json()) as Project
-    setProjects((current) => [...current, project])
-    setSelectedProjectId(project.id)
-    setSelectedTaskId(null)
-    setShowProjectForm(false)
+  async function createProject(name: string, description: string) {
+    try {
+      const project = await api.createProject(name, description)
+      setProjects((current) => [{ ...project, tasks: [] }, ...current])
+      selectProject(project.id)
+      setModal(null)
+    } catch (caught) { fail(caught) }
   }
 
-  async function createTask(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
+  async function deleteProject(id: string) {
+    try { await api.deleteProject(id); if (id === selectedProjectId) selectProject(null); await loadDashboard() } catch (caught) { fail(caught) }
+  }
+
+  async function createTask(title: string, description: string, config: TaskConfig, files: File[] = []) {
     if (!selectedProjectId) return
-    const form = new FormData(event.currentTarget)
-    const assigned_agent_ids = form.getAll('agents').map(String)
-    const task = await fetch(`${API}/api/projects/${selectedProjectId}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: form.get('title'), description: form.get('description'), assigned_agent_ids }) }).then((response) => response.json()) as Task
-    setProjects((current) => current.map((project) => project.id === selectedProjectId ? { ...project, tasks: [...project.tasks, task] } : project))
-    setSelectedTaskId(task.id)
-    setShowTaskForm(false)
+    try {
+      const task = await api.createTask(selectedProjectId, title, description, config)
+      if (files.length) await api.uploadAttachments(task.id, files)
+      setProjects((current) => current.map((project) => project.id === selectedProjectId ? { ...project, tasks: [task, ...project.tasks] } : project))
+      setSelectedTaskId(task.id)
+      setModal(null)
+    } catch (caught) { fail(caught) }
   }
 
-  async function runTask(taskId: string) {
-    await fetch(`${API}/api/tasks/${taskId}/run`, { method: 'POST' })
-    await loadDashboard()
+  async function deleteTask(id: string) {
+    try { await api.deleteTask(id); if (id === selectedTaskId) setSelectedTaskId(null); await loadDashboard() } catch (caught) { fail(caught) }
+  }
+
+  async function runTask(id: string) {
+    try {
+      const run = await api.runTask(id)
+      setProjects((current) => current.map((project) => ({ ...project, tasks: project.tasks.map((task) => task.id === id ? { ...task, status: 'running', latest_run_id: run.id } : task) })))
+      await loadRun(run.id)
+    } catch (caught) { fail(caught) }
+  }
+
+  async function cancelRun(id: string) {
+    try { await api.cancelRun(id) } catch (caught) { fail(caught) }
   }
 
   return (
@@ -105,106 +159,100 @@ export function App() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark">◉</span> GODVIEW <span>ENGINE</span></div>
         <div className="system-readout">
-          <span>SYS <b>LOCAL</b></span><i />
-          <span>AGENTS <b>{runningAgents}/{agents.length}</b></span><i />
-          <span>EVENTS <b>{events.length}</b></span><i />
-          <span>NET <b className={connected ? 'ok' : 'bad'}>{connected ? 'SYNCED' : 'OFFLINE'}</b></span>
+          <span>MODE <b>RESEARCH</b></span><i />
+          <span>WORKING <b>{working}</b></span><i />
+          <span>SKILLS <b>{skillCount}</b></span><i />
+          <span>NET <b className={connected ? 'ok' : 'bad'}>{connected ? 'SYNCED' : 'RECONNECTING'}</b></span>
         </div>
-        <div className="utc">{new Date().toLocaleTimeString([], { hour12: false })} LOCAL</div>
+        {Object.entries(limits).map(([provider, limit]) => <span key={provider} className={`limit-pill ${limit.status === 'allowed' ? 'ok' : 'bad'}`} title="Your own subscription window as reported by the CLI">
+          {provider.toUpperCase()} {limit.status === 'allowed' ? 'OK' : 'LIMIT'}{limit.rateLimitType ? ` · ${limit.rateLimitType.replace('_', ' ')}` : ''}{limit.resetsAt ? ` · resets ${new Date(limit.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}` : ''}
+        </span>)}
+        <button className="icon-button" onClick={() => setModal('settings')} aria-label="Settings" title="Settings, providers and skills"><SettingsIcon size={15} /></button>
+        <LiveClock />
       </header>
 
+      {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss error"><X size={13} /></button></div>}
+
       <aside className="left-panel">
-        <section className="panel-section project-heading">
+        <section className="panel-section">
           <div className="section-label"><CircleDot size={13} /> PROJECTS</div>
-          <button className="icon-button" onClick={() => setShowProjectForm(true)} aria-label="Create project"><FolderPlus size={16} /></button>
+          <button className="icon-button" onClick={() => setModal('project')} aria-label="Create project"><FolderPlus size={16} /></button>
         </section>
         <div className="project-list">
-          {projects.length === 0 && <div className="empty">Create a project to begin.</div>}
-          {projects.map((project) => <button key={project.id} className={`project-row ${project.id === selectedProjectId ? 'selected' : ''}`} onClick={() => { setSelectedProjectId(project.id); setSelectedTaskId(null) }}>
-            <span><b>{project.name}</b><small>{project.tasks.length} task{project.tasks.length === 1 ? '' : 's'}</small></span><ChevronRight size={14} />
-          </button>)}
-        </div>
-
-        <section className="panel-section stream-heading"><div className="section-label"><Radio size={13} /> EVENT STREAM</div><span className="live-dot">LIVE</span></section>
-        <div className="event-stream">
-          {selectedEvents.length === 0 && <div className="empty">Agent telemetry appears here during a run.</div>}
-          {selectedEvents.slice(0, 40).map((event) => <div className="event-row" key={event.id}>
-            <time>{timeLabel(event.created_at)}</time><span>{event.from_agent_id?.slice(0, 3).toUpperCase() ?? 'SYS'}</span><p>{event.message}</p>
+          {projects.length === 0 && <div className="empty">Create a project, then ask it research questions.</div>}
+          {projects.map((project) => <div key={project.id} role="button" tabIndex={0} className={`project-row ${project.id === selectedProjectId ? 'selected' : ''}`} onClick={() => selectProject(project.id)} onKeyDown={(event) => { if (event.key === 'Enter') selectProject(project.id) }}>
+            <span><b>{project.name}</b><small>{project.tasks.length} task{project.tasks.length === 1 ? '' : 's'} · {project.memory_count} memories</small></span>
+            <button className="ghost-icon" onClick={(event) => { event.stopPropagation(); if (window.confirm(`Delete project “${project.name}”, its tasks, runs and memory?`)) void deleteProject(project.id) }} aria-label="Delete project"><Trash2 size={12} /></button>
+            <ChevronRight size={14} />
           </div>)}
         </div>
+        <div className="left-tabs">
+          <button className={leftTab === 'stream' ? 'active' : ''} onClick={() => setLeftTab('stream')}><Radio size={12} /> STREAM</button>
+          <button className={leftTab === 'memory' ? 'active' : ''} onClick={() => setLeftTab('memory')} disabled={!selectedProjectId}><Brain size={12} /> MEMORY</button>
+          <button className={leftTab === 'predictions' ? 'active' : ''} onClick={() => setLeftTab('predictions')} disabled={!selectedProjectId}><Crosshair size={12} /> CALLS</button>
+          <span className={`live-dot ${connected ? '' : 'off'}`}>{connected ? 'LIVE' : 'OFFLINE'}</span>
+        </div>
+        {leftTab === 'stream' || !selectedProjectId
+          ? <div className="event-stream">
+            {projectEvents.length === 0 && <div className="empty">Agent telemetry appears here during a run.</div>}
+            {projectEvents.slice(0, 80).map((event) => <EventRow key={event.id} event={event} onSelectAgent={(key) => { if (event.task_id) setSelectedTaskId(event.task_id); setSelectedAgent(key) }} />)}
+          </div>
+          : leftTab === 'memory' ? <MemoryPanel projectId={selectedProjectId} refreshKey={memoryKey} /> : <PredictionsPanel book={book} projectId={selectedProjectId} />}
       </aside>
 
       <section className="workspace">
         <div className="workspace-toolbar">
-          <div><p className="eyebrow">ACTIVE PROJECT</p><h1>{selectedProject?.name ?? 'No project selected'}</h1></div>
-          <div className="metrics"><Metric label="TASKS" value={selectedProject?.tasks.length ?? 0} /><Metric label="WORKING" value={runningAgents} /><Metric label="STATUS" value={refreshing ? 'SYNCING' : connected ? 'READY' : 'WAIT'} /></div>
+          <div className="workspace-title"><p className="eyebrow">{selectedProject?.name ?? 'NO PROJECT'}</p><h1>{selectedTask?.title ?? 'Select or create a research task'}</h1></div>
         </div>
-
-        <GodView agents={agents} events={events} clock={clock} selectedTask={selectedTask} />
+        <div className="workspace-body">
+          <Suspense fallback={<div className="god-view"><div className="canvas-empty">Loading graph…</div></div>}><GodView detail={selectedTask ? detail : null} liveEvents={events} selectedAgent={selectedAgent} onSelectAgent={setSelectedAgent}
+            emptyHint={selectedTask ? 'Start the research to watch the orchestrator hire its team.' : 'Select a task to watch its agents.'} /></Suspense>
+          <div className="notification-stack" aria-live="polite">
+            {notifications.map((notification) => <div className={`notification ${notification.kind}`} key={notification.id}>
+              <BellRing size={14} /><div><small>{notification.kind.replace('_', ' ').toUpperCase()}</small><p>{notification.message}</p></div>
+              <button onClick={() => setNotifications((current) => current.filter((item) => item.id !== notification.id))} aria-label="Dismiss"><X size={13} /></button>
+            </div>)}
+          </div>
+        </div>
       </section>
 
-      <aside className="right-panel">
-        <section className="task-header"><div><p className="eyebrow">WORK QUEUE</p><h2>{selectedProject ? 'Tasks' : 'Select a project'}</h2></div>{selectedProject && <button className="icon-button" onClick={() => setShowTaskForm(true)} aria-label="Create task"><Plus size={17} /></button>}</section>
-        <div className="task-list">
-          {selectedProject?.tasks.map((task) => <button key={task.id} className={`task-card ${task.id === selectedTaskId ? 'selected' : ''}`} onClick={() => setSelectedTaskId(task.id)}>
-            <div><span className={`status-dot ${task.status}`} /><span className="task-status">{task.status}</span></div><b>{task.title}</b><small>{task.assigned_agent_ids.length ? `${task.assigned_agent_ids.length} agents selected` : 'orchestrator decides on run'}</small>
-          </button>)}
-          {selectedProject && selectedProject.tasks.length === 0 && <div className="empty">No tasks yet. Add one to send the swarm to work.</div>}
-        </div>
-        {selectedTask && <TaskInspector task={selectedTask} agents={agents} onRun={() => void runTask(selectedTask.id)} />}
-      </aside>
+      <TaskPanel project={selectedProject} task={selectedTask} detail={detail} selectedAgent={agent}
+        onSelectTask={setSelectedTaskId} onCreateTask={() => setModal('task')} onDeleteTask={(id) => void deleteTask(id)}
+        onRun={(id) => void runTask(id)} onCancel={(id) => void cancelRun(id)} onCloseAgent={() => setSelectedAgent(null)} onOpenReport={() => setModal('report')}
+        liveEvents={events} onSelectAgent={setSelectedAgent} predictions={book?.items ?? []} />
 
-      {showProjectForm && <ProjectModal onClose={() => setShowProjectForm(false)} onSubmit={createProject} />}
-      {showTaskForm && selectedProject && <TaskModal project={selectedProject} onClose={() => setShowTaskForm(false)} onSubmit={createTask} />}
-      <div className="notification-stack" aria-live="polite">
-        {notifications.map((notification) => <div className={`notification ${notification.kind}`} key={notification.id}>
-          <BellRing size={14} /><div><small>{notification.from_agent_id?.toUpperCase() ?? 'SYSTEM'}{notification.to_agent_id ? ` → ${notification.to_agent_id.toUpperCase()}` : ''}</small><p>{notification.message}</p></div><button onClick={() => setNotifications((current) => current.filter((item) => item.id !== notification.id))}><X size={13} /></button>
-        </div>)}
-      </div>
+      <Suspense fallback={null}>
+      {modal === 'project' && <ProjectModal onClose={() => setModal(null)} onCreate={(name, description) => void createProject(name, description)} />}
+      {modal === 'task' && selectedProject && <TaskModal project={selectedProject} providers={providers} defaults={defaults} onClose={() => setModal(null)} onCreate={(title, description, config, files) => void createTask(title, description, config, files)} />}
+      {modal === 'settings' && <SettingsModal onClose={() => setModal(null)} onSaved={setDefaults} />}
+      {modal === 'report' && detail?.run.report && <ReportModal title={selectedTask?.title ?? 'Report'} report={detail.run.report} onClose={() => setModal(null)} />}
+      </Suspense>
     </main>
   )
 }
 
-function Metric({ label, value }: { label: string; value: string | number }) { return <span><small>{label}</small><b>{value}</b></span> }
+function LiveClock() {
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  return <div className="utc">{now.toLocaleTimeString([], { hour12: false })}</div>
+}
 
-function GodView({ agents, events, clock, selectedTask }: { agents: Agent[]; events: SwarmEvent[]; clock: number; selectedTask: Task | null }) {
-  const taskEvents = selectedTask ? events.filter((event) => event.task_id === selectedTask.id && (!selectedTask.run_started_at || new Date(event.created_at).getTime() >= new Date(selectedTask.run_started_at).getTime())) : []
-  const latestEvent = taskEvents[0]
-  const agentById = new Map(agents.map((agent) => [agent.id, agent]))
-  const visibleAgentIds = new Set(['orchestrator'])
-  if (selectedTask?.status === 'complete') selectedTask.assigned_agent_ids.forEach((agentId) => visibleAgentIds.add(agentId))
-  taskEvents.forEach((event) => { if (event.from_agent_id) visibleAgentIds.add(event.from_agent_id); if (event.to_agent_id) visibleAgentIds.add(event.to_agent_id) })
-  const visibleAgents = agents.filter((agent) => visibleAgentIds.has(agent.id))
-  const activeEvents = taskEvents.filter((event) => event.from_agent_id && event.to_agent_id && clock - new Date(event.created_at).getTime() < 4600 && agentById.has(event.from_agent_id) && agentById.has(event.to_agent_id)).slice(0, 12)
-  const activeLinks = new Set(activeEvents.map((event) => `${event.from_agent_id}-${event.to_agent_id}`))
-  return <div className="god-view">
-    <div className="grid-overlay" />
-    <div className="canvas-caption">LIVE AGENT TOPOLOGY <span>•</span> SELECTED SWARM</div>
-    <svg className="links" viewBox="0 0 100 100" preserveAspectRatio="none">
-      {agentLinks.map(([fromId, toId]) => {
-        const from = agentById.get(fromId); const to = agentById.get(toId)
-        if (!from || !to || !visibleAgentIds.has(fromId) || !visibleAgentIds.has(toId)) return null
-        const isActive = activeLinks.has(`${fromId}-${toId}`)
-        return <path key={`${fromId}-${toId}`} className={isActive ? 'active-link' : ''} d={`M ${from.x} ${from.y} L ${to.x} ${to.y}`} />
-      })}
-      {activeEvents.map((event) => {
-        const from = agentById.get(event.from_agent_id!); const to = agentById.get(event.to_agent_id!)
-        if (!from || !to) return null
-        return <circle className="message-pulse" key={event.id} r="0.72"><animateMotion dur="1.05s" repeatCount="indefinite" path={`M ${from.x} ${from.y} L ${to.x} ${to.y}`} /></circle>
-      })}
-    </svg>
-    {visibleAgents.map((agent) => <article key={agent.id} style={{ left: `${agent.x}%`, top: `${agent.y}%` }} className={`agent-node ${agent.status}`}>
-      <span className="node-light" /><div><b>{agent.name}</b><small>{agent.role}</small></div><em>{statusLabel(agent.status)}</em>
-    </article>)}
-    <div className="canvas-footer"><Activity size={14} /><span>{latestEvent?.message ?? (selectedTask ? 'Orchestrator is ready to choose this task’s swarm.' : 'Select a task to view its swarm.')}</span></div>
+function EventRow({ event, onSelectAgent }: { event: SwarmEvent; onSelectAgent: (key: string) => void }) {
+  const [expanded, setExpanded] = useState(false)
+  const long = event.message.length > 140
+  const who = event.from_agent_id ?? 'system'
+  return <div className={`event-row kind-${event.kind} ${expanded ? 'expanded' : ''}`}>
+    <time>{timeLabel(event.created_at)}</time>
+    <button className="event-agent" title={who} onClick={() => event.from_agent_id && onSelectAgent(event.from_agent_id)}>{abbreviate(who)}</button>
+    <p>{event.message}</p>
+    {long && <button className="text-toggle" onClick={() => setExpanded((value) => !value)}>{expanded ? 'LESS' : 'MORE'}</button>}
   </div>
 }
 
-function TaskInspector({ task, agents, onRun }: { task: Task; agents: Agent[]; onRun: () => void }) {
-  const assigned = agents.filter((agent) => task.assigned_agent_ids.length === 0 || task.assigned_agent_ids.includes(agent.id))
-  return <div className="task-inspector"><div className="inspector-title"><Bot size={16} /><span>SELECTED TASK</span></div><h3>{task.title}</h3><p>{task.description || 'No description added.'}</p><div className="agent-chips">{assigned.length ? assigned.map((agent) => <span key={agent.id}>{agent.name}</span>) : <span className="orchestrator-note">ORCHESTRATOR DECIDES ON RUN</span>}</div>{task.result && <div className="swarm-result"><span>SWARM RESULT</span><p>{task.result}</p>{task.completed_at && <small>Completed {timeLabel(task.completed_at)}</small>}</div>}<button disabled={task.status === 'running'} className="run-button" onClick={onRun}><Play size={14} fill="currentColor" />{task.status === 'running' ? 'SWARM RUNNING' : task.result ? 'RUN AGAIN' : 'RUN SWARM'}</button></div>
+function abbreviate(key: string) {
+  const parts = key.split('_').filter(Boolean)
+  return (parts.length > 1 ? parts.map((part) => part[0]).join('') : key.slice(0, 3)).slice(0, 3).toUpperCase()
 }
-
-function ProjectModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-layer"><form className="modal" onSubmit={onSubmit}><button type="button" className="modal-close" onClick={onClose}><X size={17} /></button><p className="eyebrow">NEW CONTAINER</p><h2>Create project</h2><label>PROJECT NAME<input name="name" placeholder="Launch website" required autoFocus /></label><label>CONTEXT<textarea name="description" placeholder="What is this project for?" rows={3} /></label><button className="primary" type="submit">CREATE PROJECT</button></form></div> }
-
-function TaskModal({ project, onClose, onSubmit }: { project: Project; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-layer"><form className="modal" onSubmit={onSubmit}><button type="button" className="modal-close" onClick={onClose}><X size={17} /></button><p className="eyebrow">{project.name.toUpperCase()}</p><h2>Create task</h2><label>TASK TITLE<input name="title" placeholder="Build the landing page" required autoFocus /></label><label>BRIEF<textarea name="description" placeholder="Give the orchestrator useful context." rows={3} /></label><p className="orchestrator-copy">The orchestrator reads this brief, selects the right workers, then reveals them in the live swarm as it dispatches each one.</p><button className="primary" type="submit">CREATE TASK</button></form></div> }
