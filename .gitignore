@@ -26,6 +26,11 @@ quant/.cache
 __pycache__/
 .pytest_cache/
 
+# RLCD: trained models, registry and feedback are local artifacts
+backend/rlcd/.venv
+backend/rlcd/var/
+
 # user skill library: local data, not shipped with the engine
 skills/*
 !skills/README.md
+quant/data/

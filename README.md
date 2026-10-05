@@ -57,6 +57,31 @@ desk detect it, pick a horizon and optional timeframes, and drop/paste chart scr
 Outputs are probabilities with a measured track record, not guarantees or financial advice. Realtime CME/OTC FX
 options and tick data need a paid feed; the sidecar's data layer is where such adapters plug in.
 
+## RLCD: the calibrated decision model (`backend/rlcd`)
+
+An independent API (port 8095, `make rlcd`) that answers typed questions with probabilities instead of text. It
+follows the System One contract (one request = a `state` plus typed `questions`; answers are a **choice**, a
+**score** or a **noul**, the probability that a statement is true), and it is our own outcome-trained model, not a
+language model: every question maps to a trained head.
+
+- **Intent heads** decide what a "Just ask" task wants: a position or research, day trade or swing. Below a
+  confidence gate the keyword rules decide instead, and the event log says which did.
+- **Setup heads** (`setup:5m`, `setup:15m`, `setup:1h`) answer which of buy, sell or neither reaches its target
+  before its stop from the latest candle close, with the fixed day-trade risk (stop 20 pips, targets 50 and 100).
+- **Pattern nouls** answer yes/no questions only when the pattern is on the chart: continuation after a pullback,
+  fakeout, retest then continue.
+- **Training data** comes from the quant sidecar: years of one-minute history stored locally (`quant/.cache/m1`,
+  imported from free sources or your own MetaTrader exports in `quant/data/import/`), candles built from it, and for
+  every candle the chart-structure, session, news-timing and currency-strength features with what happened next.
+- **Calibration** uses sklearn's `CalibratedClassifierCV` on time-ordered folds; the most recent 20% of time is
+  never trained on and every number shown in Settings → RLCD MODEL comes from it.
+- **Bernoulli layer**: each decision is a win/lose trial. The model reports expected R, the Kelly fraction and a
+  running win-rate estimate per probability band, and may only say "act" when that estimate beats breakeven with
+  90% probability. Until the held-back trades beat breakeven, every decision is `hold`, with the reason.
+
+`make rlcd-train` retrains everything. `POST /v1/systemone`, `/v1/rank`, `/v1/decide`, `/v1/scan`, `/v1/feedback`,
+`/v1/train`, `GET /v1/calibration`, `/v1/bernoulli` are documented in `backend/rlcd/README.md`.
+
 ## Engine pieces (`backend/src/harness`)
 
 | Module | What it does |

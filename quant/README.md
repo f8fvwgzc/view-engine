@@ -47,6 +47,13 @@ A bad symbol, interval or parameter returns 400 `{error, kind}`. Missing data re
 | `GET /session-story?symbol=XAUUSD&interval=15m&days=3&pip=0.1` | how each session (Asia, London, New York) acted on the last N trading days: open/close, body and wick extremes, range and net move in pips, break or sweep of the previous session's body high/low, lines broken/retested/rejected, impulse count, a character label. Plus `now` (current session, lines above/below with status, untouched session extremes, calendar blackouts, if-then `next_actions`) and `markdown` |
 | `GET /levels?symbol&intervals=4h,1h,15m&pip=&history_days=` | level reactions for any symbol. Swing body levels of each interval are merged into zones (within 0.25 ATR of the lowest interval) that remember which timeframes formed them. Every interaction is classified (`rejection`, `sweep`, `break`, `retest_hold`, `retest_fail`) with session, wick depth and follow-through. Returns the top zones above and below price with score and reaction history, hold-vs-break statistics by confluence, prior respected touches, role flip, session and approach (Wilson CIs, n, and the same statistic on shuffled candles), the multi-timeframe stack with the forming higher-timeframe candle, the odds for a touch now, and `markdown` |
 | `GET /mtf?symbol&intervals=4h,1h,15m,5m&pip=&sl_pips=25&tp_pips=50&tp2_pips=100&fakeout_max=3` | top-down read. Per timeframe: `regime` (consolidation, impulse or trend by body swings), the `box` with body edges, wick extremes and where price sits, `last_impulse` / `lead_in_impulse`, wick `sweeps`, body-close `fakeouts`, box `history`, and what must print to continue up or down. Combined: `stack` (context → setup → trigger with a one-paragraph reading), `playbook` (mode `range`, `break_retest`, `trend_pullback` or `stand_aside`, with zones, stops, targets, `reasons` and an ordered `cases` list of sell / buy / hold), `prior_box_edges`, measured `odds` with a shuffled-candle baseline, `data_note`, `needs` and `markdown` |
+| `GET /chart?symbol&interval=15m&bars=300&pip=&sl_pips=20&tp_pips=50&tp2_pips=100` | annotated chart of one interval (`5m 15m 1h 4h 1d`): candles plus swings, consolidation boxes, zones, sweeps / fakeouts / breaks / retests, impulses, patterns, sessions, news, the playbook and a plain `reading` with a stated risk rule. See "Annotated chart" below |
+| `GET /dataset?symbol&interval=15m&pip=&sl_pips=20&tp_pips=50&tp2_pips=100&horizon=48&spread_pips=&max_rows=20000` | training export for the external decision model: one row per closed candle of the trigger interval (5m, 15m or 1h) with 119 scale-free chart-structure features (`feature_names`, `X`) and outcome labels `y` (`long_tp1`, `short_tp1`, `long_tp2`, `short_tp2`, `long_r`, `short_r`, `best`). Unknown values are null |
+| `GET /features?symbol&interval=15m&pip=&sl_pips=&tp_pips=&tp2_pips=` | the same feature vector `x` for the latest closed candle (or `as_of`), from the same code path as `/dataset`, plus `facts` (regime per timeframe, box, last break and impulse, nearest zones, session, forming higher-timeframe candles) and `data_note` |
+| `POST /history/import` | start a background import into the local M1 store. Body: `{"symbols": [...], "from_year": 2021, "source": "histdata" \| "dukascopy" \| "folder", "tz": "UTC"}`. Returns a job id |
+| `GET /history/import/{job}` | progress and per-symbol report of an import job |
+| `GET /history/coverage?symbol=` | what the local M1 store holds: per symbol the sources, first and last minute, rows, and gaps longer than a weekend |
+| `GET /events/history?currency=&from=&to=` | scheduled high-impact events (US releases, FOMC, ECB, BoJ) from official schedule pages, 2019 onward |
 | `GET /history/status?symbol` | how many Dukascopy days are cached on disk for a symbol, and whether the feed is rate-limiting |
 | `GET /snapshot?symbol=USDJPY&timeframes=1d,4h,1h&horizon=1d` | combined pack of all of the above, plus `markdown`, a dense LLM-ready summary of about 1–1.5k tokens. A section that fails shows up under `errors` and doesn't fail the rest |
 
@@ -105,7 +112,7 @@ bars, 17:00 NY for FX, metals and futures daily bars, and 16:00 NY for US cash d
 ## Replay mode
 
 `/snapshot`, `/analysis`, `/structure`, `/signals`, `/session-story`, `/retest`, `/backtest`, `/predict`, `/correlation`,
-`/sessions` and `/price` accept `as_of=<UTC ISO timestamp>`. Every series is cut to the candles that had **closed** by
+`/sessions`, `/price` and `/chart` accept `as_of=<UTC ISO timestamp>`. Every series is cut to the candles that had **closed** by
 then before anything is computed, and "now", the current session and minutes-until are all relative to it.
 The response carries `replay: true` and `replay_as_of` (the requested time); `as_of` stays the timestamp of the data.
 `/price?as_of=` returns the last close at or before that time. Models train only on data up to `as_of`.
@@ -172,3 +179,143 @@ past timestamps, for example to score a replayed plan.
   with cached Dukascopy files the candles are real spot candles; other days are futures minus an interpolated basis.
 - `/signals` adds `range_sweep` (wick beyond a box edge that closed back inside) and `range_edge` (first arrival in
   an edge zone).
+
+## Feature export (`/dataset`, `/features`)
+
+- **Rows.** One per closed candle of the trigger interval, after a 300-candle warm-up. The trigger's two higher
+  timeframes are fixed: 5m → 15m and 1h, 15m → 1h and 4h, 1h → 4h and 1d. Feature names use the prefixes `tr_`,
+  `ht1_` and `ht2_`, so they stay the same across trigger intervals; `timeframes` in the response gives the mapping.
+- **Features.** 28 structure features per timeframe (regime one-hot, swing labels, pullback flag and depth, distance
+  to the last swing high and low, box state, sweeps, fakeouts, last body break, last impulse), 3 for each forming
+  higher-timeframe candle, then time and session, volatility, the trigger candle and recent path, the nearest
+  support and resistance zones, and alignment. Distances are in ATR of the trigger timeframe; nothing is a raw
+  price, so symbols can be pooled. `feature_docs()` in `app/dataset.py` has a one-line meaning for each.
+- **No look-ahead.** A row uses only candles closed by its own close time. Higher-timeframe state comes from that
+  timeframe's completed candles; the forming candle is rebuilt from trigger candles. A test checks that cutting the
+  series after a row, or changing every later candle, leaves the row identical, and that `/features` equals the
+  `/dataset` row for the same time.
+- **Labels.** Entry at the row's close, both directions simulated over the next `horizon` candles. `*_tp1` and
+  `*_tp2` are 1 when the target is reached before the stop; a stop and target inside one candle count as the stop.
+  `long_r` / `short_r` are the realised R of the tp1 trade net of the spread. `best` is `buy`, `sell` or `hold`.
+  Rows whose horizon is not complete have null labels.
+- **Base rates.** A driftless random walk wins tp1 about `sl / (sl + tp)` of the time (0.286 at 20/50). The stop and
+  target are in pips, so on a slow pair and a short interval most rows time out: EURUSD 15m reached 50 pips in 12
+  hours on only about 4–5% of rows.
+
+## Local M1 store (deep history)
+
+- **Store.** `quant/.cache/m1/<SYMBOL>/<YYYY>.npz` holds one-minute candles (UTC, sorted, de-duplicated) plus a
+  `meta.json` with the source of each year. `quant/.cache` and `quant/data/` are git-ignored.
+- **HistData importer.** Free M1 "ASCII" zips from HistData.com: yearly files for past years, monthly for the current
+  year. The client sends one request at a time, at least 3 seconds apart, with an honest User-Agent, and caches every
+  zip. A CAPTCHA, block or changed form stops the source. The CSV is read from the zip in memory; any member other
+  than the one `.csv` (and its `.txt` note) is rejected, and a download is capped at 60 MB.
+- **Time zone.** HistData documents these files as "EST without daylight saving". The files downloaded here are in
+  New York wall time (UTC-4 in summer): September data lined up with our feed at UTC-4 and January data at UTC-5,
+  and the daily break sits at 16:59 → 18:00 all year. The importer decides per file from the session break.
+- **Drop folder.** Put MetaTrader history exports (MT5 `<DATE> <TIME> <OPEN> ...` or the old
+  `YYYY.MM.DD,HH:MM,o,h,l,c,v`) or HistData files in `quant/data/import/` and run `POST /history/import` with
+  `"source": "folder"`. The symbol comes from the file name. MetaTrader times are broker server time: put the zone
+  in a `<file>.tz` note (for example `Europe/Athens` or `UTC+2`); without it they are read as UTC and the report says so.
+  Files from the drop folder replace stored minutes they overlap.
+- **Use.** When the store covers a symbol, 1m / 5m / 15m / 30m / 1h / 4h / 1d candles are built from it, and the live
+  feed is stitched on for anything newer. The price offset between the two on their overlap is measured, removed
+  from the newer candles and reported under `history.stitch` and in `data_note`. For gold this replaces
+  basis-adjusted futures with real spot. `as_of` works over the whole history.
+- **Analysis caps.** `/retest` and `/levels` use at most 30,000 candles per interval, `/backtest` and `/mtf` 60,000.
+  `/dataset` uses everything.
+
+## Bulk export
+
+- `/dataset` takes `start`, `end` and `format`. `format=json` is capped by `max_rows`. `format=npz` returns a numpy
+  `.npz` with no row cap: `X` (float32, NaN = unknown), `times` (int64 epoch seconds), the label arrays (float32),
+  `best` (int8: 0 hold, 1 buy, 2 sell, -1 unlabelled) and `meta` (a JSON string).
+- Long histories are computed in chunks of 20,000 trigger candles, each warmed up on the 6,000 candles before it.
+  `/features` computes only the last chunk, so it equals the `/dataset` row and stays fast.
+- Finished exports are cached in `quant/.cache/exports/`, keyed by symbol, interval, parameters and the data.
+
+## structure-v2 (news, strength, daily/weekly context, pattern labels)
+
+- **Trigger intervals:** 1m (higher 5m, 15m), 5m, 15m, 1h and 4h (higher 1d, 1wk). One-minute exports are capped
+  at the last 500,000 rows unless `start` is given.
+- **Daily and weekly context** (`d1_*`, `w1_*`, 9 features each): swing trend, pullback direction and depth, last
+  body break (direction, age, distance to the broken edge), box state and position, last impulse direction.
+  Weekly candles are built from the daily ones.
+- **News timing** (`news_*`, 16 features): minutes to the next and since the last scheduled high-impact event of the
+  pair's currencies (capped at 1440), event-today and within-60-minutes flags, and the type of the next and last
+  event (nfp, cpi, fomc, claims, central_bank, other). The schedule is known in advance, so this is not look-ahead.
+  The table (`app/events.py`, `GET /events/history`) comes from ALFRED/FRED release dates, the Fed's FOMC calendars,
+  the ECB and the BoJ. Unscheduled meetings are stored but never used. The Bank of England site and bls.gov refused
+  our client, so there are no GBP events; AUD, CAD, CHF and NZD have none either. `meta.news_coverage` lists what
+  each symbol has.
+- **Currency strength** (`str_*`, 9 features): for each of the eight majors, its volatility-normalised move against
+  the others over 1h, 4h and 1d, from 5m candles of the seven USD pairs; per row the base value, the quote value and
+  their difference. For gold the base value is gold's own move and the quote value is USD strength.
+- **Pattern-outcome labels** (extra arrays in the npz, listed in `meta.label_names` / `meta.label_docs`):
+  `cont_after_pullback`, `ht1_cont_after_pullback`, `fakeout`, `retest_then_continue`. Each is 0/1 where the row is
+  that situation and NaN elsewhere.
+- **`meta.feature_groups`** maps every feature to session, news, structure, zones, strength, volatility or candle.
+
+## structure-v3 (candlestick and chart patterns)
+
+- **Features** (`app/patterns.py`, group `patterns`, 88 features): on the trigger and the first higher timeframe,
+  nine candlestick patterns (`*_cs_*`, signed +1 bullish / -1 bearish) and seven chart-pattern families from the
+  confirmed body swings (`*_cp_<family>_{active,dir,state,age,dist_atr}`): double, triple, head and shoulders,
+  triangle, wedge, flag and pennant. Tolerances are in ATR and are listed at the top of the module;
+  `feature_docs()` has one line per feature.
+- **No look-ahead.** A candlestick pattern is known at the close of the candle that completes it. A chart pattern
+  exists from the candle on which its last swing is confirmed, and is `confirmed` (state 2) only by a body close
+  through its trigger line. A forming pattern is dropped after 120 candles or when price closes beyond its
+  invalidation level; a confirmed one is kept for 40 candles.
+- **`/features` additions:** `applicable` (for each pattern-outcome label, whether the current row is that
+  situation), `feature_docs` (name → one-line meaning), `label_docs`, and `facts.patterns`.
+- **`/symbols`** now returns `aliases` for every symbol.
+
+## Annotated chart (`/chart`)
+
+One call returns the candles of an interval together with every drawing the method reads a chart by, so a UI can
+draw its own annotated chart. Nothing is detected here: the endpoint places the output of `/structure`, `/mtf`,
+`/levels`, the pattern detectors, the event table and the session clock on the candles.
+
+- **Timeframes.** The chart interval plus its two higher ones: `5m → 15m, 1h`; `15m → 1h, 4h`; `1h → 4h, 1d`;
+  `4h → 1d, 1wk`; `1d → 1wk, 1mo`. The playbook is the `/mtf` playbook for those three intervals.
+- **Coordinates.** Every time (`t`, `start`, `end`, `break_time`, `confirmed_at`, `known_at`) is the **open time of a
+  candle in `candles`**, or lies outside the window: before the first candle (the row has `started_before`; boxes
+  and sessions are clamped to the first candle) or after the last one (a session end or a news time still to come).
+  News keeps the exact release time in `time`; sessions keep `open_utc` / `close_utc`.
+- **`candles`** `{t,o,h,l,c}`: the last `bars` closed candles, then the forming one with `forming: true`.
+- **`swings`** body swings (`label` HH / HL / LH / LL, or H / L for the first or an equal one), with `confirmed_at`.
+- **`boxes`** consolidation boxes of this interval that overlap the window, plus the current box of each higher
+  timeframe. `state` is `active`, `broken_up` or `broken_down`; `end` is null while active. `pending` marks a close
+  outside that is younger than 24 candles (a close back inside revives the box). `known_at` is the candle whose
+  close made the box known: the part of the box to its left is drawn with hindsight.
+- **`zones`** the `/levels` zones inside the visible price range, plus the nearest one above and below it
+  (`outside_view`). `touches` counts resolved reactions, `respected` the holds, `strength` is the `/levels` score.
+- **`events`** `sweep_high/low` (wick beyond a swing or a box edge that closed back), `fakeout_up/down` (body close
+  outside a box, back inside within 3 candles), `break_up/down` (`of: box` = body close outside a box; `of: swing` =
+  body close through the protected swing of the swing trend), `retest_hold/fail` (first touch of a drawn zone after
+  a close through it). One marker per candle and type; `text` says what happened in plain words.
+- **`patterns`** chart patterns alive now and those confirmed inside the window (`kind: chart`, with `points`,
+  `trigger_level`, `trigger_line`, `state` forming / confirmed), and candlestick patterns on the last 30 candles
+  (`kind: candlestick`, one point). `patterns_note` repeats the study result: no pattern showed a directional edge.
+- **`reading`** `regime`, `phase` (consolidation, impulse, corrective_retracement, continuation,
+  break_awaiting_retest, range_edge), a three-sentence `summary`, `what_next` (what must print for up / down, in
+  body-close terms), `wait_for` (the candle conditions to wait for, most important first) and `risk`.
+- **Risk rule** (returned as `reading.risk.rule`, with the factor flags in `reading.risk.factors`): start at low and
+  go one step up for each of: the fixed stop is smaller than half the ATR14 of this interval; a scheduled
+  high-impact event within 60 minutes (before or after); price mid-box (25–75% of the reference box); the entry the
+  plan points to is against the higher timeframe's direction; two or more fakeouts on the current box; thin session
+  (neither London nor New York open, and not the first 2 hours of Tokyo); market closed or the last closed candle
+  older than two candles (the FX weekend is not counted as age). 0 = low, 1–2 = medium, 3 or more = high.
+  Risk rates conditions, it is not a signal.
+- **Caching.** Everything that depends only on closed candles is computed once per closed candle (about 1–3 s) and
+  cached; polls in between take about 10 ms and refresh only the forming candle, `price`, the `past` flag of the
+  news and the clock-dependent risk factors. The measured odds quoted in `playbook.cases[].risk` come from the
+  `/mtf` cache; when they are missing they are computed in the background and `odds_pending` is true until then.
+- **Replay.** `as_of` works as everywhere else: only candles closed by then, no forming candle, `price` = the last
+  close, and news from the schedule table only.
+- **Price.** `price` is the live quote when it agrees with the candle feed to within one ATR (then the forming
+  candle's close, high and low follow it); otherwise the candle feed's last value. `price_source` says which.
+  When the candle feed is delayed and has not delivered the current candle yet (gold futures candles run about ten
+  minutes late), the forming candle is a stub with `synthetic: true`: it opens at the last close and its high and
+  low only span that close and the quote.

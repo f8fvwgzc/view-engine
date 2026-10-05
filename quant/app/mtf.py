@@ -923,12 +923,16 @@ def build_playbook(tfs: dict[str, dict], stack: dict, pip: float, sl_pips: float
     box = box_tf["box"]
     iv = box_tf["interval"]
     p = box["position"]
+    now_px = tfs[trig_iv]["last_close"]  # freshest closed price: the box timeframe's last close can be hours old
     if p["state"] == "inside":
         mid_lo = box["bottom"] + 0.3 * (box["top"] - box["bottom"])
         mid_hi = box["top"] - 0.3 * (box["top"] - box["bottom"])
+        height = box["top"] - box["bottom"]
+        pct = (now_px - box["bottom"]) / height * 100 if height > 0 else 50.0
+        where = "near_top" if pct >= 75 else "near_bottom" if pct <= 25 else "mid_box"
         return {"mode": "range", "timeframe": iv, "box": {k: box[k] for k in ("top", "bottom", "mid", "wick_high",
                                                                               "wick_low", "height_pips")},
-                "price_position": p["where"], "pct_of_height": p["pct_of_height"],
+                "price_position": where, "pct_of_height": pct, "price_now": now_px,
                 "sell_zone": _zone("sell", box_tf, pip, sl_pips, tp_pips, tp2_pips, trig, iv),
                 "buy_zone": _zone("buy", box_tf, pip, sl_pips, tp_pips, tp2_pips, trig, iv),
                 "no_trade_zone": {"low": mid_lo, "high": mid_hi, "note": "mid-box: no trade, wait for an edge"},
@@ -939,8 +943,9 @@ def build_playbook(tfs: dict[str, dict], stack: dict, pip: float, sl_pips: float
     zw = zone_width(box["top"] - box["bottom"], box_tf["atr"])
     h_since = box["wick_low"] if down else box["wick_high"]
     mm = edge + d * (box["top"] - box["bottom"])
-    last = box_tf["last_close"]
+    last = now_px
     dist = abs(last - edge) / pip
+    back = d * (last - edge) < 0  # the trigger timeframe has already traded back through the broken edge
     return {
         "mode": "break_retest", "timeframe": iv, "direction": "short" if down else "long",
         "broken_edge": edge, "box": {k: box[k] for k in ("top", "bottom", "mid", "wick_high", "wick_low",
@@ -948,7 +953,7 @@ def build_playbook(tfs: dict[str, dict], stack: dict, pip: float, sl_pips: float
         "break": {"close": p["break_close"], "candle_close_time": p["break_candle_close_time"],
                   "candles_ago": p["candles_ago"], "pips_beyond_now": p["pips_beyond"], "marginal": p["marginal"]},
         "retest_zone": {"low": edge - zw if down else edge - 0.25 * zw, "high": edge + 0.25 * zw if down else edge + zw},
-        "distance_to_retest_pips": dist,
+        "distance_to_retest_pips": dist, "price_now": last, "price_back_through_edge": bool(back),
         "stop": edge - d * sl_pips * pip, "stop_pips": sl_pips,
         "targets": _targets(edge, d, pip, tp_pips, tp2_pips, None, None, "", "")
         + [{"name": "measured_move", "price": mm, "pips": abs(mm - edge) / pip, "capped_at": None}],
@@ -999,7 +1004,8 @@ def build_cases(tfs: dict[str, dict], stack: dict, pb: dict, pip: float, odds: O
         down = pb["direction"] == "short"
         d = -1 if down else 1
         z, box = pb["retest_zone"], pb["box"]
-        last = tfs[iv]["last_close"]
+        last = pb.get("price_now", tfs[iv]["last_close"])
+        now_side = "below" if last < E else "above"
         act, opp_act = ("sell", "buy") if down else ("buy", "sell")
         side, oside = ("below", "above") if down else ("above", "below")
         flip_iv = setup_iv if INTERVALS[setup_iv][4] < INTERVALS[iv][4] else iv
@@ -1018,7 +1024,7 @@ def build_cases(tfs: dict[str, dict], stack: dict, pb: dict, pip: float, odds: O
                  f"turns the old {'support into resistance' if down else 'resistance into support'}",
                  f"stop {_px(E - d * sl * pip)} = {sl:g} pips beyond the edge; {risk}"),
             case("hold", f"price stays {side} {_px(E)} without coming back to it (now: {_px(last)}, "
-                         f"{pb['distance_to_retest_pips']:.0f} pips {side} the edge)",
+                         f"{pb['distance_to_retest_pips']:.0f} pips {now_side} the edge)",
                  reason=f"no retest = no entry; a {act} here is chasing with the stop far from the level"),
             case("hold", f"price runs to {_px(tg[-1]['price'])} (prior extreme / measured move) without ever "
                          f"retesting {_px(E)}",
@@ -1150,8 +1156,11 @@ def build_reasons(tfs: dict[str, dict], stack: dict, playbook: dict, pip: float)
                    + (" → no trade until an edge is reached." if playbook["price_position"] == "mid_box" else "."))
     elif m == "break_retest":
         z = playbook["retest_zone"]
+        where = (f"price is back at the edge now, {playbook['distance_to_retest_pips']:.0f} pips through it"
+                 if playbook.get("price_back_through_edge") else
+                 f"{playbook['distance_to_retest_pips']:.0f} pips away")
         out.append(f"Plan (break → retest): {playbook['direction']} only on a retest of {_px(playbook['broken_edge'])} "
-                   f"(zone {_px(z['low'])}–{_px(z['high'])}, {playbook['distance_to_retest_pips']:.0f} pips away) that "
+                   f"(zone {_px(z['low'])}–{_px(z['high'])}, {where}) that "
                    f"is rejected by a closing candle; {playbook['cancel']}.")
     elif m == "trend_pullback":
         z = playbook["pullback_zone"]
@@ -1165,10 +1174,11 @@ def build_reasons(tfs: dict[str, dict], stack: dict, playbook: dict, pip: float)
 # ------------------------------------------------------------------ service
 
 def analyze_mtf(ctxs: dict[str, Context], pip: float, sl_pips: float = 25, tp_pips: float = 50,
-                tp2_pips: float = 100, fakeout_max: int = FAKEOUT_MAX) -> dict:
-    """Pure: contexts of CLOSED candles per interval -> per-timeframe read, stack, playbook, reasons, cases."""
+                tp2_pips: float = 100, fakeout_max: int = FAKEOUT_MAX, states: Optional[dict] = None) -> dict:
+    """Pure: contexts of CLOSED candles per interval -> per-timeframe read, stack, playbook, reasons, cases.
+    `states` = precomputed box_states per interval (optional; /chart shares them with its drawings)."""
     order = sorted(ctxs, key=lambda x: -INTERVALS[x][4])
-    tfs = {iv: read_timeframe(ctxs[iv], pip, fakeout_max=fakeout_max) for iv in order}
+    tfs = {iv: read_timeframe(ctxs[iv], pip, (states or {}).get(iv), fakeout_max=fakeout_max) for iv in order}
     stack = build_stack(tfs, order, pip)
     playbook = build_playbook(tfs, stack, pip, sl_pips, tp_pips, tp2_pips)
     playbook["reasons"] = build_reasons(tfs, stack, playbook, pip)
@@ -1184,6 +1194,43 @@ def analyze_mtf(ctxs: dict[str, Context], pip: float, sl_pips: float = 25, tp_pi
     return {"timeframes": tfs, "stack": stack, "playbook": playbook, "prior_box_edges": edges}
 
 
+def make_data_note(sym: Symbol, info: dict) -> dict:
+    """Feed name, H4 grid and the 'levels differ from your broker' caveat (shared by /mtf, /features)."""
+    from .data import h4_offset
+    ov = (info.get("basis_info") or {}).get("spot_overlay")
+    grid = "18:00 New York (spot metals session open)" if h4_offset(sym) == 2 else "17:00 New York"
+    feed = str(info.get("source"))
+    note = {
+        "feed": feed, "feed_short": feed.split(" (")[0].split(";")[0][:60] + (
+            f" + Dukascopy spot candles on {ov['days']} day(s)" if ov else ""),
+        "h4_grid": f"H4 candles start on the {grid} grid",
+        "levels_caveat": "levels can differ from your broker's chart by several dollars/pips (different feed, bid "
+                         "vs mid, futures-derived candles); compare the shape and which side of a line a candle "
+                         "closed, not the exact price",
+    }
+    hist = info.get("history") or {}
+    if hist.get("provider") == "local M1 store":
+        stc = hist.get("stitch") or {}
+        note["feed_short"] = (f"local M1 store ({'+'.join(hist.get('store_sources', []))}) "
+                              f"{str(hist.get('store_first'))[:10]}→{str(hist.get('store_last'))[:10]}"
+                              + (f" + {stc['tail_candles']} newer candle(s) from the live feed (offset "
+                                 f"{stc.get('tail_offset', 0):+.5g} removed)" if stc.get("tail_candles") else ""))
+        note["history_source"] = {"store": hist.get("store_sources"), "first": hist.get("store_first"),
+                                  "last": hist.get("store_last"), "m1_rows": hist.get("store_m1_rows"),
+                                  "stitch": stc}
+        if sym.spot_code:
+            note["gold_basis"] = ("candles come from stored real spot M1 data, not from basis-adjusted futures; only "
+                                  "candles newer than the store use the live feed, shifted by the measured offset")
+        return note
+    if info.get("basis_adjusted"):
+        note["gold_basis"] = (
+            (f"real spot candles (Dukascopy bid) on {ov['days']} cached day(s), {ov['first']} … {ov['last']}; "
+             if ov else "no real spot candles cached; ")
+            + "other days are COMEX futures minus a basis interpolated between those days (can be several dollars "
+              "off intraday)")
+    return note
+
+
 def mtf(sym: Symbol, intervals: Optional[list[str]] = None, pip: Optional[float] = None, sl_pips: float = 25,
         tp_pips: float = 50, tp2_pips: float = 100, fakeout_max: int = FAKEOUT_MAX) -> dict:
     ivs = list(dict.fromkeys(intervals or ["4h", "1h", "15m", "5m"]))
@@ -1197,7 +1244,7 @@ def mtf(sym: Symbol, intervals: Optional[list[str]] = None, pip: Optional[float]
         ctxs, needs = {}, []
         for iv in ivs:
             try:
-                ctxs[iv] = build_context(sym, iv, now, max_bars=1_000_000)
+                ctxs[iv] = build_context(sym, iv, now, max_bars=60_000)
                 if len(ctxs[iv].run.swings) < 4:
                     needs.append({"interval": iv, "reason": "fewer than 4 confirmed swings"})
             except Exception as e:
@@ -1225,21 +1272,7 @@ def mtf(sym: Symbol, intervals: Optional[list[str]] = None, pip: Optional[float]
         from .data import h4_offset
         ov = (info.get("basis_info") or {}).get("spot_overlay")
         grid = "18:00 New York (spot metals session open)" if h4_offset(sym) == 2 else "17:00 New York"
-        feed = str(info.get("source"))
-        data_note = {
-            "feed": feed, "feed_short": feed.split(" (")[0].split(";")[0][:60] + (
-                f" + Dukascopy spot candles on {ov['days']} day(s)" if ov else ""),
-            "h4_grid": f"H4 candles start on the {grid} grid",
-            "levels_caveat": "levels can differ from your broker's chart by several dollars/pips (different feed, bid "
-                             "vs mid, futures-derived candles); compare the shape and which side of a line a candle "
-                             "closed, not the exact price",
-        }
-        if info.get("basis_adjusted"):
-            data_note["gold_basis"] = (
-                (f"real spot candles (Dukascopy bid) on {ov['days']} cached day(s), {ov['first']} … {ov['last']}; "
-                 if ov else "no real spot candles cached; ")
-                + "other days are COMEX futures minus a basis interpolated between those days (can be several dollars "
-                  "off intraday)")
+        data_note = make_data_note(sym, info)
         out = {
             "symbol": sym.id, "params": {"intervals": order, "pip": pip_used, "sl_pips": sl_pips, "tp_pips": tp_pips,
                                          "tp2_pips": tp2_pips, "fakeout_max": fakeout_max},

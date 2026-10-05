@@ -218,7 +218,7 @@ def backtest(sym: Symbol, interval: str = "1h", k: int = 24, target_r: float = 1
         history_days = default_history_days(sym)
 
     def load():
-        ctx = build_context(sym, interval, max_bars=1_000_000, history_days=history_days)
+        ctx = build_context(sym, interval, max_bars=60_000, history_days=history_days)
         res = run_backtest(ctx, k, target_r, cost_r)
         info = ctx.source_info or {"source": ctx.source}
         notes = [

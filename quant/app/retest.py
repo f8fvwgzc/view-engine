@@ -29,6 +29,7 @@ GRID_SL = [10, 15, 20, 25, 30, 40, 50, 60]
 GRID_TP = [30, 50, 75, 100, 150]
 PCTS = (50, 70, 80, 90, 95)
 GRID_MIN_N = 50
+MAX_ANALYSIS_BARS = 30_000  # per interval; the local M1 store can hold years
 SIGNAL_SL_PIPS, SIGNAL_TP_PIPS = 25.0, (50.0, 75.0, 100.0)
 
 
@@ -401,8 +402,9 @@ def retest(sym: Symbol, interval: str = "15m", level_interval: str = "1h", pip: 
     spread = spread_pips if spread_pips is not None else default_spread_price(sym) / pip_used
 
     def load():
-        ctx = build_context(sym, interval, max_bars=1_000_000, history_days=history_days)
-        lvl_ctx = ctx if level_interval == interval else build_context(sym, level_interval, max_bars=1_000_000,
+        ctx = build_context(sym, interval, max_bars=MAX_ANALYSIS_BARS, history_days=history_days)
+        lvl_ctx = ctx if level_interval == interval else build_context(sym, level_interval,
+                                                                       max_bars=MAX_ANALYSIS_BARS,
                                                                        history_days=history_days)
         res = retest_core(ctx, lvl_ctx, pip_used, sl_pips, tp_pips, spread, tol_pips, max_wait, k, levels,
                           grid_entry)
@@ -529,7 +531,7 @@ def retest_markdown(r: dict) -> str:
             L.append(f"| {kk} | {s['n']} | {_f(s['win_rate'], pct=True)} | {_f(s['expectancy_pips'], 1, sign=True)} | "
                      f"{s['verdict']} |")
     h = r.get("history")
-    if h and not h.get("complete"):
+    if h and h.get("requested_days") and not h.get("complete"):
         L.append(f"- History: asked for {h['requested_days']} days, Dukascopy cache holds {h['days_used']} contiguous "
                  f"day(s){' (feed is rate-limiting; backfill continues)' if h.get('rate_limited') else ''}.")
     L.append("- Verdict rule: CI lower bound > breakeven, expectancy > 0 and n ≥ 100. Statistics, not advice.")

@@ -1,4 +1,4 @@
-import type { Backtest, SkillImport, WatchItem, Attachment, Dashboard, MarketSymbol, MemoryItem, PredictionBook, Project, Provider, Run, RunDetail, Settings, Skill, Task, TaskConfig } from './types'
+import type { ChartData, RlcdDecision, Backtest, SkillImport, WatchItem, Attachment, Dashboard, MarketSymbol, MemoryItem, PredictionBook, Project, Provider, Run, RunDetail, Settings, Skill, Task, TaskConfig } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 
@@ -43,6 +43,15 @@ export const api = {
   importSkills: (source: string, overwrite: boolean) => request<SkillImport>('/api/skills/import', { method: 'POST', body: JSON.stringify({ source, overwrite }) }),
   retest: (symbol: string, pip: number, sl: number, tp: number) => request<{ markdown?: string; active?: { level: number; level_type: string; level_interval: string; status: string; break_direction?: string; distance_pips?: number }[]; notes?: string[] | string }>(`/api/market/retest?symbol=${encodeURIComponent(symbol)}&interval=15m&level_interval=1h&pip=${pip}&sl_pips=${sl}&tp_pips=${tp}`),
   mtf: (symbol: string, pip: number, sl: number, tp: number) => request<{ markdown?: string }>(`/api/market/mtf?symbol=${encodeURIComponent(symbol)}&intervals=4h,1h,15m,5m&pip=${pip}&sl_pips=${sl}&tp_pips=${tp}&tp2_pips=${tp * 2}`),
+  rlcdHealth: () => request<Record<string, unknown>>('/api/rlcd/health'),
+  rlcdHeads: () => request<unknown>('/api/rlcd/heads'),
+  rlcdCalibration: (head: string) => request<Record<string, unknown>>(`/api/rlcd/calibration?head=${encodeURIComponent(head)}`),
+  rlcdDecide: (symbol: string, pip?: number, interval = '15m') => request<RlcdDecision>('/api/rlcd/decide', { method: 'POST', body: JSON.stringify({ symbol, interval, sl_pips: 20, tp_pips: 50, tp2_pips: 100, ...(pip ? { pip } : {}) }) }),
+  chart: (symbol: string, interval: string, asOf?: string, bars = 160) => request<ChartData>(`/api/market/chart?symbol=${encodeURIComponent(symbol)}&interval=${interval}&bars=${bars}${asOf ? `&as_of=${encodeURIComponent(asOf)}` : ''}`),
+  rlcdBernoulli: (head: string) => request<Record<string, unknown>>(`/api/rlcd/bernoulli?head=${encodeURIComponent(head)}`),
+  rlcdScan: () => request<Record<string, unknown>>('/api/rlcd/scan', { method: 'POST', body: JSON.stringify({ interval: '15m', sl_pips: 20, tp_pips: 50, tp2_pips: 100 }) }),
+  rlcdTrain: (body: Record<string, unknown> = {}) => request<Record<string, unknown>>('/api/rlcd/train', { method: 'POST', body: JSON.stringify(body) }),
+  rlcdTrainStatus: (job: string) => request<Record<string, unknown>>(`/api/rlcd/train/${encodeURIComponent(job)}`),
   levels: (symbol: string) => request<{ markdown?: string }>(`/api/market/levels?symbol=${encodeURIComponent(symbol)}&intervals=4h,1h,15m`),
   backtest: (symbol: string, interval: string) => request<Backtest>(`/api/market/backtest?symbol=${encodeURIComponent(symbol)}&interval=${interval}`),
   skill: (name: string) => request<Skill>(`/api/skills/${encodeURIComponent(name)}`),

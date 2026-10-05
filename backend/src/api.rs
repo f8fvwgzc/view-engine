@@ -156,6 +156,17 @@ pub async fn create_task(Path(project_id): Path<Uuid>, State(state): State<Share
         return Err((StatusCode::BAD_REQUEST, "Task title is required".into()));
     }
     let config = if payload.config.is_object() { payload.config } else { json!({}) };
+    // A mode the user picked by hand is a label for the intent model: it learns from every explicit choice.
+    if let Some(label) = match config["mode"].as_str() { Some("trading") => Some("position"), Some("research") => Some("research"), _ => None } {
+        let (harness, text, style) = (state.harness.clone(), format!("{title}\n{}", payload.description.trim()), config["style"].as_str().map(String::from));
+        tokio::spawn(async move {
+            let model_state = json!({"text": text});
+            harness.rlcd.feedback(&json!({"head": "intent", "state": model_state, "label": label, "source": "task_mode_chosen_by_user"})).await;
+            if let Some(style) = style.filter(|style| label == "position" && (style == "daytrade" || style == "swing")) {
+                harness.rlcd.feedback(&json!({"head": "trade_style", "state": model_state, "label": style, "source": "task_style_chosen_by_user"})).await;
+            }
+        });
+    }
     sqlx::query_as::<_, Task>(&format!("INSERT INTO tasks (id, project_id, title, description, status, config) VALUES ($1, $2, $3, $4, 'ready', $5) RETURNING {TASK_COLUMNS}"))
         .bind(Uuid::new_v4())
         .bind(project_id)
@@ -498,6 +509,62 @@ pub async fn market_retest(Query(params): Query<HashMap<String, String>>, State(
         return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
     }
     state.harness.quant.retest(&params).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// RLCD (calibrated decision model) passthroughs: status, heads with their holdout metrics, reliability tables,
+/// a direct day-trade decision without any agent, and training.
+pub async fn rlcd_health(State(state): State<SharedState>) -> Json<Value> {
+    Json(state.harness.rlcd.health().await)
+}
+
+pub async fn rlcd_heads(State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    state.harness.rlcd.get("/v1/heads", &[], 10).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+pub async fn rlcd_calibration(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| key == "head").collect();
+    state.harness.rlcd.get("/v1/calibration", &params, 20).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+pub async fn rlcd_decide(State(state): State<SharedState>, Json(body): Json<Value>) -> ApiResult<Json<Value>> {
+    if body["symbol"].as_str().map(str::trim).filter(|symbol| !symbol.is_empty()).is_none() {
+        return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
+    }
+    state.harness.rlcd.decide(&body).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// Calibrated call on several instruments at once, best first (the session-open scan on demand).
+pub async fn rlcd_scan(State(state): State<SharedState>, Json(body): Json<Value>) -> ApiResult<Json<Value>> {
+    let body = if body.is_object() { body } else { json!({}) };
+    state.harness.rlcd.post("/v1/scan", &body, 120).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// Bernoulli view of a head: realised win-rate posterior per probability bin and the test against breakeven.
+pub async fn rlcd_bernoulli(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| key == "head").collect();
+    state.harness.rlcd.get("/v1/bernoulli", &params, 20).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+pub async fn rlcd_train(State(state): State<SharedState>, Json(body): Json<Value>) -> ApiResult<Json<Value>> {
+    let body = if body.is_object() { body } else { json!({}) };
+    state.harness.rlcd.post("/v1/train", &body, 30).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+pub async fn rlcd_train_status(Path(job): Path<String>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    if !job.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err((StatusCode::BAD_REQUEST, "invalid job id".into()));
+    }
+    state.harness.rlcd.get(&format!("/v1/train/{job}"), &[], 10).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+/// The annotated chart: candles with zones, HH/HL/LH/LL, boxes, sweeps, patterns and the reading, ready to draw.
+pub async fn market_chart(Query(params): Query<HashMap<String, String>>, State(state): State<SharedState>) -> ApiResult<Json<Value>> {
+    const ALLOWED: &[&str] = &["symbol", "interval", "bars", "as_of", "pip", "sl_pips", "tp_pips", "tp2_pips"];
+    let params: Vec<(String, String)> = params.into_iter().filter(|(key, _)| ALLOWED.contains(&key.as_str())).collect();
+    if !params.iter().any(|(key, _)| key == "symbol") {
+        return Err((StatusCode::BAD_REQUEST, "symbol is required".into()));
+    }
+    state.harness.quant.chart(&params).await.map(Json).map_err(|error| (StatusCode::BAD_GATEWAY, error))
 }
 
 /// Top-down read for any instrument: consolidation or impulse per timeframe, failed wick sweeps and the playbook.

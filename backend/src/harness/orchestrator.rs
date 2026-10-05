@@ -172,6 +172,8 @@ async fn run_inner(state: SharedState, run_id: Uuid, cancelled: Arc<AtomicBool>)
     .fetch_one(&database)
     .await
     .map_err(|error| format!("run not found: {error}"))?;
+    // "Just ask" tasks: work out what is being asked (a position or research, day trade or swing) before anything else.
+    let task_config = auto_route(&state, (project_id, task_id, run_id), &task_title, &task_brief, task_config).await;
     let mut settings = RunSettings::load(&database, &task_config).await;
     // Day trading needs minutes, not tens of minutes: one pass per agent and no mid-run hiring.
     let daytrade = task_config["style"].as_str() == Some("daytrade");
@@ -1112,6 +1114,97 @@ async fn finalize(ctx: &RunContext, orchestrator_id: Uuid) -> Result<(), String>
     Ok(())
 }
 
+/// Resolves a task created in "auto" mode: RLCD (or the keyword rules when it is down or unsure) decides whether
+/// the user wants a position or research and which trading style, the chart headers supply the instrument, and
+/// the resolved configuration is stored on the task so the UI and later runs see the same thing.
+async fn auto_route(state: &SharedState, ids: (Uuid, Uuid, Uuid), title: &str, brief: &str, mut config: Value) -> Value {
+    if config["mode"].as_str() != Some("auto") {
+        return config;
+    }
+    let (project_id, task_id, run_id) = ids;
+    let harness = &state.harness;
+    let attachments: Vec<std::path::PathBuf> = sqlx::query_scalar::<_, String>("SELECT path FROM attachments WHERE task_id = $1 ORDER BY created_at")
+        .bind(task_id)
+        .fetch_all(&state.database)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+    let text = format!("{title}\n{brief}");
+    let mut symbol = config["symbol"].as_str().map(str::trim).filter(|symbol| !symbol.is_empty()).map(String::from);
+    if symbol.is_none() {
+        symbol = harness.quant.detect(&text).await;
+    }
+    // Say something at once: routing can take a while when a chart has to be read, and a silent screen looks stuck.
+    EventDraft::new(project_id, task_id, run_id, "intent_reading", "Working out what you are asking: a position or research, day trade or swing…").from(ORCHESTRATOR).publish(state).await;
+    // The instrument is needed for the data pack. When the text does not name it, the chart header does: one
+    // cheap vision call on the first two screenshots reads it. When the text already names it, skip the call.
+    let mut chart_timeframes: Vec<String> = Vec::new();
+    let mut charts = Value::Null;
+    if symbol.is_none() && !attachments.is_empty() {
+        EventDraft::new(project_id, task_id, run_id, "intent_reading", "Reading the instrument and timeframe from your chart header…").from(ORCHESTRATOR).publish(state).await;
+        let settings = RunSettings::load(&state.database, &json!({})).await;
+        let request = LlmRequest {
+            provider: settings.provider,
+            model: None,
+            system: prompts::SYSTEM_CONSTITUTION.into(),
+            prompt: prompts::chart_header_prompt(),
+            web: false,
+            timeout: Duration::from_secs(75),
+            json_schema: Some(prompts::chart_header_schema()),
+            progress: None,
+            attachments: attachments.iter().take(2).cloned().collect(),
+            effort: Some("low".into()),
+        };
+        if let Ok((response, _)) = harness.llm_routed(&request, &router::resolve(&settings, "utility"), CallSite { run_id, agent_id: None, cacheable: true }).await {
+            if let Some(read) = response.structured.or_else(|| extract_json(&response.text)) {
+                chart_timeframes = read["charts"].as_array().into_iter().flatten().filter_map(|chart| chart["timeframe"].as_str()).map(String::from).collect();
+                if symbol.is_none() {
+                    let named: Vec<&str> = read["charts"].as_array().into_iter().flatten().filter_map(|chart| chart["symbol"].as_str()).collect();
+                    symbol = harness.quant.detect(&named.join(" ")).await;
+                }
+                charts = read;
+            }
+        }
+    }
+    let routed = harness.rlcd.route(&text, attachments.len(), symbol.as_deref(), &chart_timeframes).await;
+    if let Some(object) = config.as_object_mut() {
+        object.insert("mode".into(), json!(routed.mode));
+        object.insert("routed_by".into(), json!(routed.source));
+        object.insert("routing".into(), json!({"detail": routed.detail, "charts": charts}));
+        if routed.mode == "trading" {
+            object.insert("style".into(), json!(routed.style));
+            if let Some(symbol) = &symbol {
+                object.insert("symbol".into(), json!(symbol));
+            }
+            if routed.style == "daytrade" {
+                // The day-trade risk rule is fixed: stop 20 pips, targets 50 and 100 pips.
+                for (key, value) in [("sl_pips", 20.0), ("tp_pips", 50.0), ("tp2_pips", 100.0)] {
+                    object.entry(key).or_insert(json!(value));
+                }
+                object.entry("depth").or_insert(json!("quick"));
+                object.entry("horizon").or_insert(json!("8h"));
+            } else {
+                object.entry("horizon").or_insert(json!("1w"));
+            }
+        }
+    }
+    let _ = sqlx::query("UPDATE tasks SET config = $2 WHERE id = $1").bind(task_id).bind(&config).execute(&state.database).await;
+    let summary = match (routed.mode, routed.style) {
+        ("trading", "daytrade") => format!("Understood as a day-trade position request{} — technical desk, stop 20 pips, targets 50 and 100 pips.", symbol.as_ref().map(|symbol| format!(" on {symbol}")).unwrap_or_default()),
+        ("trading", _) => format!("Understood as a swing position request{} — full desk with fundamentals and research.", symbol.as_ref().map(|symbol| format!(" on {symbol}")).unwrap_or_default()),
+        _ => "Understood as a research request — research team.".to_string(),
+    };
+    EventDraft::new(project_id, task_id, run_id, "intent_detected", format!("{summary} (decided by {})", if routed.source == "rlcd" { "the RLCD model" } else { "keyword rules" }))
+        .from(ORCHESTRATOR)
+        .data(json!({"mode": routed.mode, "style": routed.style, "source": routed.source, "symbol": symbol, "detail": routed.detail, "charts": charts}))
+        .publish(state)
+        .await;
+    config
+}
+
 /// Loads the trading desk context: instrument, data pack from the quant sidecar, chart screenshots.
 /// Returns the desk section appended to the orchestrator's hiring prompt (empty for research tasks).
 async fn prepare_trading(ctx: &RunContext, config: &Value) -> String {
@@ -1185,6 +1278,17 @@ async fn prepare_trading(ctx: &RunContext, config: &Value) -> String {
             }
             Err(error) => ctx.event("market_unavailable", format!("Top-down read unavailable ({error}); the head trader needs H4 and H1 screenshots to judge the range.")).from(ORCHESTRATOR).publish(&ctx.state).await,
         }
+        let mut rlcd_request = json!({"symbol": symbol, "interval": "15m", "sl_pips": sl_pips, "tp_pips": tp_pips, "tp2_pips": tp2_pips, "text": ctx.task_title});
+        if let Some(pip) = pip { rlcd_request["pip"] = json!(pip) }
+        if let Some(as_of) = as_of { rlcd_request["as_of"] = json!(as_of.to_rfc3339()) }
+        match harness.rlcd.decide(&rlcd_request).await {
+            Ok(decision) => {
+                sections.push(format!("## RLCD calibrated decision (outcome-trained model; M15 entry, fixed stop and targets)\n{}", super::rlcd::decision_markdown(&decision)));
+                let _ = sqlx::query("UPDATE runs SET market = jsonb_set(COALESCE(market, '{}'::jsonb), '{rlcd}', $2) WHERE id = $1").bind(ctx.run_id).bind(&decision).execute(&ctx.state.database).await;
+                ctx.event("rlcd_decision", format!("RLCD: {} ({}) · buy {:.0}% · sell {:.0}% · neither {:.0}%.", decision["action"].as_str().unwrap_or("hold").to_uppercase(), decision["tier"].as_str().unwrap_or("hold"), decision["probabilities"]["buy"].as_f64().unwrap_or(0.0) * 100.0, decision["probabilities"]["sell"].as_f64().unwrap_or(0.0) * 100.0, decision["probabilities"]["hold"].as_f64().unwrap_or(0.0) * 100.0)).from(ORCHESTRATOR).data(decision).publish(&ctx.state).await;
+            }
+            Err(error) => tracing::debug!("rlcd decision skipped: {error}"),
+        }
         let mut levels_query = vec![("symbol".to_string(), symbol.clone()), ("intervals".to_string(), "4h,1h,15m".to_string())];
         if let Some(pip) = pip { levels_query.push(("pip".to_string(), pip.to_string())) }
         if let Some(as_of) = as_of { levels_query.push(("as_of".to_string(), as_of.to_rfc3339())) }
@@ -1209,7 +1313,13 @@ async fn prepare_trading(ctx: &RunContext, config: &Value) -> String {
     }
     // Headlines from free sources, as timing context and reasons to wait (never in replay: that would leak the future).
     if let (Some(symbol), None) = (&symbol, as_of) {
-        let hits = super::web::search(&ctx.state.database, &harness.http, &format!("{} price news today", headline_subject(symbol)), 6).await;
+        let mut hits = super::web::search(&ctx.state.database, &harness.http, &format!("{} price news today", headline_subject(symbol)), 6).await;
+        // Policy posts and statements move gold and the dollar within minutes; collect what a free search can see.
+        for hit in super::web::search(&ctx.state.database, &harness.http, "Trump Truth Social post today tariffs Fed dollar markets", 4).await {
+            if !hits.iter().any(|existing| existing.url == hit.url) {
+                hits.push(hit);
+            }
+        }
         if !hits.is_empty() {
             let lines: Vec<String> = hits.iter().map(|hit| format!("- {} — {} ({})", truncate_chars(&hit.title, 140), truncate_chars(&hit.snippet, 220), hit.url)).collect();
             market = format!("{market}\n\n## Headlines (free web search, unverified; use for timing and risk only)\n{}", lines.join("\n"));

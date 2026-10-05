@@ -1,0 +1,5 @@
+# local artifacts (models, registry, feedback, decision log) and environment
+var/
+.venv/
+__pycache__/
+.pytest_cache/

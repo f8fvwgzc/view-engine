@@ -37,24 +37,27 @@ FOLLOW_N = 16
 LIFETIME_BARS = 200  # a level stays on the chart for this many bars of its OWN interval
 MAX_CLOSES_THROUGH = 4  # after this many body closes through it, the zone is retired (chopped up)
 MIN_RELIABLE_N = 30
+MAX_ANALYSIS_BARS = 30_000  # per interval; the local M1 store can hold years
 HOLD_TYPES = ("rejection", "sweep", "retest_hold")
 BREAK_TYPES = ("break", "retest_fail")
 
 
 # ------------------------------------------------------------------ zones
 
-def base_position(closes: pd.DatetimeIndex, t: pd.Timestamp) -> float:
+def base_position(closes: pd.DatetimeIndex, t: pd.Timestamp, rate: Optional[float] = None) -> float:
     """Position of time `t` on the base-candle axis: index of the first candle closing after `t`; negative
-    (estimated from the average candles-per-hour of the data) for times before the data starts."""
+    (estimated from the average candles-per-hour of the data, or the given `rate`) for times before the data."""
     if t >= closes[0]:
         return float(closes.searchsorted(t, side="right"))
-    span_h = max((closes[-1] - closes[0]).total_seconds() / 3600, 1e-9)
-    rate = (len(closes) - 1) / span_h if len(closes) > 1 else 1.0
+    if rate is None:
+        span_h = max((closes[-1] - closes[0]).total_seconds() / 3600, 1e-9)
+        rate = (len(closes) - 1) / span_h if len(closes) > 1 else 1.0
     return -((closes[0] - t).total_seconds() / 3600) * rate
 
 
 def build_zones(levels: list[Level], base_closes: pd.DatetimeIndex, base_atr: np.ndarray, base_interval: str,
-                tol_atr: float = ZONE_TOL_ATR, arrays: Optional[tuple] = None) -> list[dict]:
+                tol_atr: float = ZONE_TOL_ATR, arrays: Optional[tuple] = None,
+                rate: Optional[float] = None) -> list[dict]:
     """Merge levels (processed in the order they became known) into zones. Causal: a level joins a zone only
     if that zone already existed, was still alive, and lies within tol at the time the level became known.
     Lifetimes are counted in BASE candles (so weekends / closed hours do not age a line)."""
@@ -67,25 +70,24 @@ def build_zones(levels: list[Level], base_closes: pd.DatetimeIndex, base_atr: np
     order: list[int] = []  # zone index for each entry of `prices`
     def retired(z: dict, pos: float) -> bool:
         """Was this zone already chopped through (MAX_CLOSES_THROUGH body closes) by candle `pos`?
-        Evaluated on candles before `pos` only."""
+        Only closes-through that resolved on candles before `pos` count (no look-ahead)."""
         if arrays is None:
             return False
         if z.get("retired_pos") is not None:
             return z["retired_pos"] <= pos
         k = int(min(pos, len(base_closes)))
-        if k < 2 or z.get("_checked", -1) >= k:
+        if k < 2:
             return False
         o, h, l, c, atr_prev, imp, pip = arrays
-        tmp = {**z, "expires_pos": min(z["expires_pos"], k)}
-        rs = zone_reactions(tmp, o[:k], h[:k], l[:k], c[:k], base_closes[:k], atr_prev[:k], imp[:k], pip)
-        if tmp.get("closes_through", 0) >= MAX_CLOSES_THROUGH:
-            z["retired_pos"] = max(r["resolved_idx"] for r in rs if r["resolved_idx"] is not None) + 1
+        rs = zone_reactions(z, o, h, l, c, base_closes, atr_prev, imp, pip, resume=True)
+        thru = [r["resolved_idx"] for r in rs if r["type"] in BREAK_TYPES]
+        if len(thru) >= MAX_CLOSES_THROUGH and thru[MAX_CLOSES_THROUGH - 1] < k:
+            z["retired_pos"] = thru[MAX_CLOSES_THROUGH - 1] + 1
             return True
-        z["_checked"] = k
         return False
 
     for lv in sorted(levels, key=lambda x: x.known_time):
-        pos = base_position(base_closes, lv.known_time)
+        pos = base_position(base_closes, lv.known_time, rate)
         i = int(pos) - 1
         atr = float(base_atr[i]) if 0 <= i < len(base_atr) and np.isfinite(base_atr[i]) and base_atr[i] > 0 \
             else first_atr
@@ -107,7 +109,6 @@ def build_zones(levels: list[Level], base_closes: pd.DatetimeIndex, base_atr: np
         if best is not None:
             best["members"].append(member)
             best["expires_pos"] = max(best["expires_pos"], member["expires_pos"])
-            best.pop("_checked", None)  # the window grew: re-check retirement next time
             continue
         z = {"id": len(zones), "price": float(lv.price), "tol": tol, "members": [member],
              "known_time": lv.known_time, "first_seen": lv.time, "expires_pos": member["expires_pos"]}
@@ -138,19 +139,28 @@ def approach_type(o, c, imp, t: int, side: int, atr: float) -> str:
 
 
 def zone_reactions(zone: dict, o, h, l, c, closes: pd.DatetimeIndex, atr_prev: np.ndarray, imp: np.ndarray,
-                   pip: float) -> list[dict]:
-    """All interactions of the base candles with one zone, in time order."""
+                   pip: float, resume: bool = False) -> list[dict]:
+    """All interactions of the base candles with one zone, in time order.
+    `resume=True` keeps the scan state on the zone, so a later call (after the zone's lifetime was extended by
+    a new member) only scans the added candles. Earlier reactions never depend on later candles."""
     n = len(c)
     P, tol = zone["price"], zone["tol"]
-    start = int(closes.searchsorted(zone["known_time"], side="right"))  # first candle closing after known
     stop = int(min(n, max(zone["expires_pos"], 0)))
-    start = max(start, 1)
-    if start >= min(stop, n):
-        return []
-    stop = min(stop, n)
+    if resume and "_rx_stop" in zone:
+        out = zone["_rx"]
+        cursor, pending_retest, closes_through, holds, flips = zone["_rx_state"]
+        start = zone["_rx_stop"]
+    else:
+        start = max(int(closes.searchsorted(zone["known_time"], side="right")), 1)  # first candle closing after known
+        out = []
+        cursor, pending_retest, closes_through, holds, flips = start, False, 0, 0, 0
+    if start >= stop or closes_through >= MAX_CLOSES_THROUGH:
+        if resume:
+            zone.update(_rx=out, _rx_state=(cursor, pending_retest, closes_through, holds, flips),
+                        _rx_stop=max(start, stop))
+            zone.update(holds=holds, flips=flips, closes_through=closes_through, pending_retest=pending_retest)
+        return out
     cand = start + np.flatnonzero((l[start:stop] <= P + tol) & (h[start:stop] >= P - tol))
-    out: list[dict] = []
-    cursor, pending_retest, closes_through, holds, flips = start, False, 0, 0, 0
     for t in cand:
         t = int(t)
         if t < cursor:
@@ -225,6 +235,8 @@ def zone_reactions(zone: dict, o, h, l, c, closes: pd.DatetimeIndex, atr_prev: n
             cursor = last
         out.append(rec)
     zone.update(holds=holds, flips=flips, closes_through=closes_through, pending_retest=pending_retest)
+    if resume:
+        zone.update(_rx=out, _rx_state=(cursor, pending_retest, closes_through, holds, flips), _rx_stop=stop)
     return out
 
 
@@ -539,7 +551,9 @@ def analyze_levels(ctxs: dict[str, Context], pip: float, now: Optional[pd.Timest
                         arrays=(o, h, l, c, base.atr_prev, base.imp, pip))
     episodes: list[dict] = []
     for z in zones:
-        z["reactions"] = zone_reactions(z, o, h, l, c, closes, base.atr_prev, base.imp, pip)
+        z["reactions"] = zone_reactions(z, o, h, l, c, closes, base.atr_prev, base.imp, pip, resume=True)
+        for r in z["reactions"]:  # members may have joined after a reaction was first scanned
+            r["confluence"] = confluence_at(z, r["time"])
         episodes += z["reactions"]
     episodes.sort(key=lambda e: e["idx"])
     stats = statistics(episodes, intervals_desc)
@@ -616,7 +630,7 @@ def levels(sym: Symbol, intervals: Optional[list[str]] = None, pip: Optional[flo
 
     def load():
         now = now_ts()
-        ctxs = {iv: build_context(sym, iv, now, max_bars=1_000_000, history_days=history_days) for iv in ivs}
+        ctxs = {iv: build_context(sym, iv, now, max_bars=MAX_ANALYSIS_BARS, history_days=history_days) for iv in ivs}
         desc = sorted(ctxs, key=lambda x: -INTERVALS[x][4])
         base_df = ctxs[desc[-1]].df
         rk = replay_key()

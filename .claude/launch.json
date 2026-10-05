@@ -31,6 +31,22 @@
         "8090"
       ],
       "port": 8090
+    },
+    {
+      "name": "rlcd",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "--directory",
+        "backend/rlcd",
+        "run",
+        "uvicorn",
+        "rlcd.api:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8095"
+      ],
+      "port": 8095
     }
   ]
 }

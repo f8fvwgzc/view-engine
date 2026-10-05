@@ -2,7 +2,7 @@ export type TaskStatus = 'ready' | 'running' | 'complete' | 'failed'
 export type AgentStatus = 'pending' | 'running' | 'retrying' | 'complete' | 'failed' | 'skipped'
 export type AgentKind = 'orchestrator' | 'intent' | 'researcher' | 'analyst' | 'strategist' | 'critic' | 'specialist'
 
-export type TaskConfig = Partial<{ provider: string; model: string; depth: 'quick' | 'standard' | 'deep'; max_agents: number; mode: 'research' | 'trading'; symbol: string; horizon: string; timeframes: string[]; style: 'daytrade' | 'swing'; sl_pips: number; tp_pips: number; tp2_pips: number; pip: number; as_of: string }>
+export type TaskConfig = Partial<{ provider: string; model: string; depth: 'quick' | 'standard' | 'deep'; max_agents: number; mode: 'auto' | 'research' | 'trading'; routed_by: 'rlcd' | 'keywords'; routing: { charts?: { charts?: { symbol?: string | null; timeframe?: string | null }[] } | null }; symbol: string; horizon: string; timeframes: string[]; style: 'daytrade' | 'swing'; sl_pips: number; tp_pips: number; tp2_pips: number; pip: number; as_of: string }>
 
 export type Task = {
   id: string; project_id: string; title: string; description: string; status: TaskStatus; config: TaskConfig
@@ -15,6 +15,29 @@ export type SwarmEvent = {
   from_agent_id: string | null; to_agent_id: string | null; data: Record<string, unknown> | null; created_at: string
 }
 
+/** RLCD's calibrated day-trade call: which action reaches its target before its stop, with the fixed pip risk. */
+export type RlcdDecision = {
+  decision_id?: string; model?: string; symbol?: string; interval?: string; time?: string; price?: number; pip?: number
+  action?: 'buy' | 'sell' | 'hold'; tier?: 'act' | 'confirm' | 'hold'; probabilities?: { buy?: number; sell?: number; hold?: number }; confidence?: number
+  breakeven_probability?: number; expected_r?: { buy?: number; sell?: number }; entry?: number; stop?: number; targets?: number[]
+  reasons?: unknown[]; warnings?: string[]
+}
+/** The annotated chart from the sidecar: candles plus every drawing and the plain reading. */
+export type ChartData = {
+  symbol: string; interval: string; pip?: number; as_of?: string; price: number; data_note?: string
+  candles: { t: string; o: number; h: number; l: number; c: number; forming?: boolean }[]
+  swings?: { t: string; price: number; kind: 'high' | 'low'; label: string }[]
+  boxes?: { interval: string; start: string; end: string | null; top: number; bottom: number; state: string }[]
+  zones?: { level: number; low?: number; high?: number; role: 'support' | 'resistance'; timeframes?: string[]; touches?: number }[]
+  events?: { t: string; price: number; type: string; text?: string }[]
+  impulses?: { start: string; end: string; from: number; to: number; direction: 'up' | 'down' }[]
+  patterns?: { name: string; kind?: string; direction?: string | null; state?: string; points?: { t: string; price: number }[]; text?: string }[]
+  sessions?: { name: string; start: string; end: string }[]
+  news?: { t: string; currency?: string; type?: string; title?: string; past?: boolean }[]
+  playbook?: { mode?: string; cases?: { action: 'sell' | 'buy' | 'hold'; when?: string; entry_price?: number | null; stop?: number | null; targets?: number[]; reason?: string; risk?: string }[] }
+  higher?: Record<string, { regime?: string; box?: { top: number; bottom: number } | null }>
+  reading?: { regime?: string; phase?: string; summary?: string; what_next?: string[]; wait_for?: string[]; risk?: { level?: 'low' | 'medium' | 'high'; reasons?: string[]; note?: string } }
+}
 export type DecisionOption = { name: string; score?: number; pros?: string[]; cons?: string[] }
 export type TradePlan = {
   symbol?: string; direction?: 'long' | 'short' | 'neutral'; probability?: number; horizon_hours?: number; entry_zone?: number[]; stop?: number; targets?: number[]
@@ -37,7 +60,7 @@ export type Run = {
   provider: string; model: string | null; config: Record<string, unknown>
   intent: { decision_to_make?: string; intent?: { goal?: string; success_criteria?: string[]; assumptions?: string[]; unknowns?: string[] }; rationale?: string } | null
   report: string | null; decision: Decision | null; error: string | null
-  market: { markdown?: string; prediction?: { prob_up?: number; validation?: { accuracy?: number; baseline_accuracy?: number; brier?: number } } } | null
+  market: { markdown?: string; prediction?: { prob_up?: number; validation?: { accuracy?: number; baseline_accuracy?: number; brier?: number } }; rlcd?: RlcdDecision } | null
   tokens_in: number; tokens_out: number; tokens_cache_read: number; tokens_cache_write: number; tokens_saved: number
   llm_calls: number; cache_hits: number; started_at: string; completed_at: string | null
 }

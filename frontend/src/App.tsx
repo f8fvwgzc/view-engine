@@ -3,7 +3,7 @@ import { BellRing, Brain, ChevronRight, Crosshair, CircleDot, FolderPlus, Radio,
 import { api } from './api'
 import { MemoryPanel } from './components/MemoryPanel'
 import { TaskPanel } from './components/TaskPanel'
-import { PredictionsPanel } from './components/Trading'
+import { ChartButton, PredictionsPanel } from './components/Trading'
 import { timeLabel, type PredictionBook, type Project, type Provider, type RunDetail, type Settings, type SwarmEvent, type TaskConfig } from './types'
 import { useLiveEvents } from './useLiveEvents'
 import { useUrlSelection } from './useUrlSelection'
@@ -167,6 +167,7 @@ export function App() {
         {Object.entries(limits).map(([provider, limit]) => <span key={provider} className={`limit-pill ${limit.status === 'allowed' ? 'ok' : 'bad'}`} title="Your own subscription window as reported by the CLI">
           {provider.toUpperCase()} {limit.status === 'allowed' ? 'OK' : 'LIMIT'}{limit.rateLimitType ? ` · ${limit.rateLimitType.replace('_', ' ')}` : ''}{limit.resetsAt ? ` · resets ${new Date(limit.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}` : ''}
         </span>)}
+        <ChartButton symbol="XAUUSD" label="CHART" />
         <button className="icon-button" onClick={() => setModal('settings')} aria-label="Settings" title="Settings, providers and skills"><SettingsIcon size={15} /></button>
         <LiveClock />
       </header>

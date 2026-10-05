@@ -19,6 +19,7 @@ pub mod process;
 pub mod prompts;
 pub mod providers;
 pub mod retry;
+pub mod rlcd;
 pub mod router;
 pub mod settings;
 pub mod simulation;
@@ -48,6 +49,8 @@ pub struct Harness {
     pub embedder: Embedder,
     /// Quant sidecar client (market data, options positioning, ML) for trading desk runs.
     pub quant: market::Quant,
+    /// RLCD client (calibrated decision model): intent routing and the fast day-trade call.
+    pub rlcd: rlcd::Rlcd,
     /// Latest subscription-window status per provider (e.g. Claude's five-hour window), shown in the UI.
     pub limits: tokio::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>,
 }

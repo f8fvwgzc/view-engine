@@ -209,6 +209,18 @@ pub fn queries_schema() -> Value {
     json!({"type": "object", "properties": {"queries": {"type": "array", "items": {"type": "string"}}}, "required": ["queries"]})
 }
 
+/// Reads only the header of each chart screenshot so the request can be routed before any analysis starts.
+pub fn chart_header_prompt() -> String {
+    "Each attached image is a trading chart screenshot. Read ONLY the header and axis labels of each one; do not analyse the chart. Return json with \"charts\": one entry per image in the order given, each {\"symbol\": instrument exactly as written (e.g. \"Gold Spot / U.S. Dollar\" or \"XAUUSD\"), \"timeframe\": one of 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1wk, 1mo, \"broker\": data source if shown, \"last_price\": number if shown, \"taken_at\": the timestamp printed on the image if any}. Use null for anything that is not visible.".to_string()
+}
+
+pub fn chart_header_schema() -> Value {
+    json!({"type": "object", "properties": {"charts": {"type": "array", "items": {"type": "object", "properties": {
+        "symbol": {"type": ["string", "null"]}, "timeframe": {"type": ["string", "null"]}, "broker": {"type": ["string", "null"]},
+        "last_price": {"type": ["number", "null"]}, "taken_at": {"type": ["string", "null"]}
+    }, "required": ["symbol", "timeframe"]}}}, "required": ["charts"]})
+}
+
 /// Appended to the orchestrator's hiring prompt for trading desk tasks.
 pub fn desk_brief(symbol: Option<&str>, horizon_hours: i32, timeframes: &[String], charts: usize, market: &str) -> String {
     format!(

@@ -4,6 +4,7 @@ import { api } from '../api'
 import { ACCENTS, DEFAULT_APPEARANCE, MONO_FONTS, SANS_FONTS, applyAppearance, loadAppearance, type Appearance } from '../appearance'
 import { ROUTE_ROLES, type MarketSymbol, type Project, type Provider, type Settings, type Skill, type SkillImport, type TaskConfig } from '../types'
 import { Markdown } from './Markdown'
+import { RlcdPanel } from './RlcdPanel'
 
 function useEscape(onEscape: () => void) {
   useEffect(() => {
@@ -38,7 +39,7 @@ const HORIZONS = [['4h', '4 hours'], ['8h', '8 hours (session)'], ['1d', '1 day'
 const TIMEFRAMES = ['5m', '15m', '1h', '4h', '1d', '1wk', '1mo'] as const
 
 export function TaskModal({ project, providers, defaults, onClose, onCreate }: { project: Project; providers: Provider[]; defaults: Settings | null; onClose: () => void; onCreate: (title: string, description: string, config: TaskConfig, files: File[]) => void }) {
-  const [mode, setMode] = useState<'research' | 'trading'>('research')
+  const [mode, setMode] = useState<'auto' | 'research' | 'trading'>('auto')
   const [depth, setDepth] = useState<'quick' | 'standard' | 'deep'>((defaults?.depth as 'quick' | 'standard' | 'deep') ?? 'standard')
   const [style, setStyle] = useState<'daytrade' | 'swing'>('daytrade')
   const [horizon, setHorizon] = useState('8h')
@@ -53,7 +54,7 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
   const addFiles = (list: FileList | File[]) => setFiles((current) => [...current, ...Array.from(list).filter((file) => file.type.startsWith('image/'))].slice(0, 6))
   // Paste a chart screenshot straight from the clipboard.
   useEffect(() => {
-    const onPaste = (event: ClipboardEvent) => { if (mode === 'trading' && event.clipboardData?.files.length) addFiles(event.clipboardData.files) }
+    const onPaste = (event: ClipboardEvent) => { if (mode !== 'research' && event.clipboardData?.files.length) addFiles(event.clipboardData.files) }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
   }, [mode])
@@ -61,7 +62,7 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
-    const config: TaskConfig = { depth, mode }
+    const config: TaskConfig = mode === 'auto' ? { mode } : { depth, mode }
     const provider = String(form.get('provider') ?? '')
     const model = String(form.get('model') ?? '').trim()
     if (provider) config.provider = provider
@@ -84,12 +85,12 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
         config.depth = depth
       }
     }
-    onCreate(String(form.get('title') ?? ''), String(form.get('description') ?? ''), config, mode === 'trading' ? files : [])
+    onCreate(String(form.get('title') ?? ''), String(form.get('description') ?? ''), config, mode === 'research' ? [] : files)
   }
   return <Modal onClose={onClose}><form onSubmit={submit}>
-    <p className="eyebrow">{project.name.toUpperCase()}</p><h2>{mode === 'trading' ? 'New trading desk task' : 'New research task'}</h2>
-    <div className="segmented">{(['research', 'trading'] as const).map((value) => <button type="button" key={value} className={mode === value ? 'active' : ''} onClick={() => setMode(value)}>{value === 'research' ? 'Research' : 'Trading desk'}</button>)}</div>
-    <label>{mode === 'trading' ? 'WHAT DO YOU WANT TO KNOW?' : 'WHAT DO YOU WANT TO FIND OUT?'}<input name="title" placeholder={mode === 'trading' ? (style === 'daytrade' ? 'Gold now: long, short or wait? Which line, which session?' : 'Where is USDJPY heading into tonight’s US CPI? Long or short?') : 'Should we launch our coffee brand in Japan next year?'} required autoFocus /></label>
+    <p className="eyebrow">{project.name.toUpperCase()}</p><h2>{mode === 'auto' ? 'Ask View Engine' : mode === 'trading' ? 'New trading desk task' : 'New research task'}</h2>
+    <div className="segmented">{(['auto', 'research', 'trading'] as const).map((value) => <button type="button" key={value} className={mode === value ? 'active' : ''} onClick={() => setMode(value)}>{value === 'auto' ? 'Just ask' : value === 'research' ? 'Research' : 'Trading desk'}</button>)}</div>
+    <label>{mode === 'research' ? 'WHAT DO YOU WANT TO FIND OUT?' : 'WHAT DO YOU WANT TO KNOW?'}<input name="title" placeholder={mode === 'auto' ? 'Drop a chart and ask “long or short now?” — or ask any research question' : mode === 'trading' ? (style === 'daytrade' ? 'Gold now: long, short or wait? Which line, which session?' : 'Where is USDJPY heading into tonight’s US CPI? Long or short?') : 'Should we launch our coffee brand in Japan next year?'} required autoFocus /></label>
     {mode === 'trading' && <>
       <div className="segmented">{(['daytrade', 'swing'] as const).map((value) => <button type="button" key={value} className={style === value ? 'active' : ''} onClick={() => { setStyle(value); setHorizon(value === 'daytrade' ? '8h' : '1d'); setDepth(value === 'daytrade' ? 'quick' : 'standard') }}>{value === 'daytrade' ? 'Day trade · pattern + sessions' : 'Swing · quant + fundamentals'}</button>)}</div>
       {style === 'daytrade' && <div className="field-row four">
@@ -106,6 +107,8 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
       <label>REPLAY — TEST ON A PAST MOMENT <small>(optional, your local time: the desk sees nothing after it and the plan is scored at once)</small><input name="as_of" type="datetime-local" max={new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16)} /></label>
       <div className="field-label">TIMEFRAMES <small>({style === 'daytrade' ? 'none = H4, H1, M15, M5' : 'none = desk chooses for the horizon'})</small></div>
       <div className="chip-select">{TIMEFRAMES.map((frame) => <button type="button" key={frame} className={timeframes.includes(frame) ? 'active' : ''} onClick={() => setTimeframes((current) => current.includes(frame) ? current.filter((item) => item !== frame) : [...current, frame])}>{frame}</button>)}</div>
+    </>}
+    {mode !== 'research' && <>
       <div className="field-label">CHART SCREENSHOTS <small>(drop, paste or browse — best is H4 + H1 + M15 of the same pair; the desk reads top-down and takes a missing timeframe from market data)</small></div>
       <label className={`dropzone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); addFiles(event.dataTransfer.files) }}>
         <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden onChange={(event) => { if (event.target.files) addFiles(event.target.files) }} />
@@ -113,8 +116,10 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
       </label>
     </>}
     <label>CONTEXT <small>(optional)</small><textarea name="description" placeholder={mode === 'trading' ? 'Your own prediction and lines (the desk tests it: what confirms it, what proves it wrong), your position, events you are worried about…' : 'Anything that helps: budget, timeline, what you already know, what a good answer looks like.'} rows={3} /></label>
+    {mode !== 'auto' && <>
     <div className="field-label">DEPTH</div>
     <div className="segmented">{(['quick', 'standard', 'deep'] as const).map((value) => <button type="button" key={value} className={depth === value ? 'active' : ''} onClick={() => setDepth(value)}>{value}</button>)}</div>
+    </>}
     <div className="field-row">
       <label>PROVIDER<select name="provider" defaultValue="">
         <option value="">Model router (settings)</option>
@@ -122,7 +127,7 @@ export function TaskModal({ project, providers, defaults, onClose, onCreate }: {
       </select></label>
       <label>MODEL <small>(optional)</small><input name="model" placeholder={defaults?.model ?? 'sonnet'} /></label>
     </div>
-    <p className="orchestrator-copy">{mode === 'trading'
+    <p className="orchestrator-copy">{mode === 'auto' ? 'View Engine works out what you are asking. A position question, with or without a chart, goes to the trading desk: a day trade gets the technical desk and the calibrated model with stop 20 pips and targets 50 and 100 pips; a swing question gets the full desk with fundamentals and research. Anything else goes to the research team.' : mode === 'trading'
       ? (style === 'daytrade'
         ? 'Technical only: the desk reads how each session acted, the body-close lines on H4/H1/M15/M5 and the retest statistics, then gives long / short / wait with the line, trigger, fixed stop and targets, and the session to act in. Recorded and scored afterwards.'
         : 'The orchestrator loads live market data (prices, correlations, calendar, options positioning, ML probability), hires a trading desk, and returns a trade plan that is recorded and scored after its horizon. Probabilities, not guarantees.')
@@ -136,7 +141,7 @@ export function ReportModal({ title, report, onClose }: { title: string; report:
 }
 
 export function SettingsModal({ onClose, onSaved }: { onClose: () => void; onSaved: (settings: Settings) => void }) {
-  const [tab, setTab] = useState<'run' | 'router' | 'skills' | 'appearance' | 'providers'>('run')
+  const [tab, setTab] = useState<'run' | 'router' | 'skills' | 'rlcd' | 'appearance' | 'providers'>('run')
   const [settings, setSettings] = useState<Settings | null>(null)
   const [providers, setProviders] = useState<Provider[]>([])
   const [embedModel, setEmbedModel] = useState('')
@@ -152,7 +157,7 @@ export function SettingsModal({ onClose, onSaved }: { onClose: () => void; onSav
     try { const result = await api.saveSettings(settings); setSettings(result); setSaved(true); setError(null); onSaved(result) } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
   }
   const saveButton = (label: string) => <div className="settings-actions"><button className="primary" onClick={() => void save()}>{saved ? <Check size={14} /> : <Save size={14} />}{saved ? 'SAVED' : label}</button></div>
-  const tabs = [['run', 'RUN DEFAULTS'], ['router', 'MODEL ROUTER'], ['skills', 'SKILLS'], ['appearance', 'APPEARANCE'], ['providers', 'PROVIDERS']] as const
+  const tabs = [['run', 'RUN DEFAULTS'], ['router', 'MODEL ROUTER'], ['skills', 'SKILLS'], ['rlcd', 'RLCD MODEL'], ['appearance', 'APPEARANCE'], ['providers', 'PROVIDERS']] as const
   return <Modal onClose={onClose} wide>
     <p className="eyebrow">VIEW ENGINE</p><h2>Settings</h2>
     <div className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
@@ -187,6 +192,7 @@ export function SettingsModal({ onClose, onSaved }: { onClose: () => void; onSav
         {saveButton('SAVE ROUTES')}
       </div>}
       {tab === 'skills' && <SkillLibrary />}
+      {tab === 'rlcd' && <RlcdPanel />}
       {tab === 'appearance' && <AppearancePanel />}
       {tab === 'providers' && <div className="provider-list">
         {providers.map((provider) => <div key={provider.id} className={`provider-row ${provider.available ? 'ok' : ''}`}>

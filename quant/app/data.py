@@ -34,6 +34,7 @@ class DataError(Exception):
 
 # interval -> (yahoo interval, yahoo period, resample rule or None, is_intraday, bar_hours)
 INTERVALS: dict[str, tuple[str, str, Optional[str], bool, float]] = {
+    "1min": ("1m", "7d", None, True, 1 / 60),  # internal key ("1m" is kept as an alias of 1mo for old callers)
     "5m": ("5m", "60d", None, True, 5 / 60),
     "15m": ("15m", "60d", None, True, 0.25),
     "30m": ("30m", "60d", None, True, 0.5),
@@ -648,6 +649,8 @@ def stitch(deep: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.DataFrame, dict
 
 
 def resample_m1(m1: pd.DataFrame, interval: str, h4_off: int = 1) -> pd.DataFrame:
+    if interval == "1min":
+        return m1[["o", "h", "l", "c", "v"]]
     rule = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h"}.get(interval)
     if rule:
         return resample_ohlc(m1, rule)
@@ -696,9 +699,76 @@ def _deep_series(sym: Symbol, interval: str, history_days: int, base: Optional[S
                   ticker=inst, interval=interval, delayed_minutes=0, history={**hist, "used": True})
 
 
+STORE_INTERVALS = ("1min", "5m", "15m", "30m", "1h", "4h", "1d")
+
+
+def bars_for_days(interval: str, days: float) -> int:
+    """Rough number of candles in `days` calendar days of a 24x5 market."""
+    return max(50, int(days * 24 / INTERVALS[interval][4] * 5 / 7))
+
+
+def _store_frame(sym: Symbol, interval: str, fp: tuple) -> pd.DataFrame:
+    """Candles of `interval` built from the local M1 store (cached until the store files change)."""
+    from . import m1store
+
+    def load():
+        m1 = m1store.load_m1(sym.id)
+        df = resample_m1(m1, interval, h4_offset(sym))
+        if INTERVALS[interval][3]:
+            # the last bin is only complete if the store reaches its final minute
+            end = df.index + pd.Timedelta(hours=INTERVALS[interval][4])
+            df = df[end <= m1.index[-1] + pd.Timedelta(minutes=2)]
+        else:
+            df = df.iloc[:-1]  # the store may end inside the last trading day
+        df.index = df.index.as_unit("ns")
+        return df
+    return cache.get_or_set(("m1frame", sym.id, interval, fp), 24 * 3600, load)
+
+
+def _store_series(sym: Symbol, interval: str, live: Optional[Series]) -> Optional[Series]:
+    """Deep history from the local M1 store, with the live feed stitched on for anything newer. The price
+    offset between the two on their overlap is measured and reported (the newer candles are level-shifted by
+    it so the series has no seam); nothing is blended silently."""
+    from . import m1store
+    if interval not in STORE_INTERVALS:
+        return None
+    fp = m1store.fingerprint(sym.id)
+    if fp is None:
+        return None
+
+    def build():
+        deep = _store_frame(sym, interval, fp)
+        if deep.empty:
+            return None
+        cov = m1store.coverage(sym.id)[0]
+        hist = {"provider": "local M1 store", "store_sources": cov["sources"], "store_first": cov["first"],
+                "store_last": cov["last"], "store_m1_rows": cov["rows"], "used": True,
+                "store_candles": int(len(deep))}
+        src = (f"local M1 store ({'+'.join(cov['sources'])}, real spot) {cov['first'][:10]}→{cov['last'][:10]} "
+               f"resampled to {interval}")
+        if live is None:
+            hist["stitch"] = {"tail_candles": 0, "note": "no live feed available; store only"}
+            return Series(df=deep, source=src, ticker=sym.id, interval=interval, delayed_minutes=0, history=hist)
+        df, st = stitch(deep, live.df)
+        st["tail_source"] = live.source
+        st["note"] = (f"candles after {iso(deep.index[-1])} come from the live feed, level-shifted by "
+                      f"{-st['tail_offset']:+.6g} (median close difference live minus store over "
+                      f"{st['overlap_candles']} overlapping candles)" if st["overlap_candles"] else
+                      "live feed appended without an overlap to measure the offset")
+        hist["stitch"] = st
+        src += (f"; newer candles ({st['tail_candles']}): {live.source.split(' (')[0]}, offset vs store "
+                f"{st['tail_offset']:+.5g} removed")
+        return Series(df=df, source=src, ticker=sym.id, interval=interval, delayed_minutes=live.delayed_minutes,
+                      fetched_at=live.fetched_at, basis=None, history=hist)
+    key = ("m1series", sym.id, interval, fp, live.fetched_at if live is not None else None,
+           len(live.df) if live is not None else 0)
+    return cache.get_or_set(key, TTL_INTRADAY, build)
+
+
 def get_series(sym: Symbol, interval: str, history_days: Optional[int] = None) -> Series:
-    """Closed+forming candles for a symbol. `history_days` asks for deep (Dukascopy) intraday history.
-    In replay mode the series is cut to candles closed by the replay timestamp."""
+    """Closed+forming candles for a symbol. When the local M1 store covers the symbol, intraday candles come
+    from it (years of history) with the live feed stitched on the end. Otherwise `history_days` asks the
+    Dukascopy day cache for deep history. In replay mode the series is cut to candles closed by `as_of`."""
     interval = norm_interval(interval)
     as_of = replay_as_of()
     base, err = None, None
@@ -707,6 +777,14 @@ def get_series(sym: Symbol, interval: str, history_days: Optional[int] = None) -
     except DataError as e:
         err = e
     out = base
+    if not (base is not None and base.source == "oanda"):
+        try:
+            stored = _store_series(sym, interval, base)
+        except Exception as e:
+            log.warning("m1 store failed for %s %s: %s", sym.id, interval, e)
+            stored = None
+        if stored is not None:
+            return truncate_to(stored, sym, as_of) if as_of is not None else stored
     need_deep = history_days is not None
     if as_of is not None and base is not None and INTERVALS[interval][3] and not need_deep:
         # replaying a moment the live source barely (or does not) cover -> try deep history

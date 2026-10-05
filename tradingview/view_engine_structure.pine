@@ -1,0 +1,177 @@
+// View Engine — body-close structure, drawn live on your own TradingView chart.
+//
+// What it draws (all from candle BODIES; wicks only count as sweeps):
+//   HH / HL / LH / LL   labels on confirmed body swings
+//   dashed lines        the last swing-high body and swing-low body (your horizontal lines)
+//   box                 consolidation: price has not closed beyond either line
+//   S                   wick went through a line and the candle closed back = sweep, not a break
+//   B                   a body closed beyond a line = break
+//   F                   that break closed back inside within N candles = fakeout
+//   R                   price came back to the broken line and closed on the break side = retest held
+//   entry / stop / T1 / T2   projected from the retest candle with your fixed pips
+//
+// How to use: TradingView → Pine Editor → paste this file → Save → Add to chart. Set "Pip size" for the instrument.
+// It runs inside TradingView and cannot call View Engine or the RLCD model; it is the same drawing rules only.
+
+//@version=5
+indicator("View Engine — body-close structure", shorttitle="VE Structure", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+// ───────── inputs
+swingLen = input.int(3, "Swing length (candles each side)", minval=1, maxval=50)
+pipSize  = input.float(0.1, "Pip size (gold 0.1 · EURUSD 0.0001 · JPY pairs 0.01)", minval=0.0, step=0.0001)
+slPips   = input.float(20.0, "Stop (pips)", minval=0.0)
+tp1Pips  = input.float(50.0, "Target 1 (pips)", minval=0.0)
+tp2Pips  = input.float(100.0, "Target 2 (pips)", minval=0.0)
+fakeBars = input.int(3, "Fakeout = closes back inside within N candles", minval=1, maxval=20)
+showBox  = input.bool(true, "Draw the consolidation box")
+showPlan = input.bool(true, "Draw entry / stop / targets on a held retest")
+showSess = input.bool(true, "Shade sessions (Tokyo, London, New York)")
+
+// ───────── body swings
+bodyHi = math.max(open, close)
+bodyLo = math.min(open, close)
+ph = ta.pivothigh(bodyHi, swingLen, swingLen)
+pl = ta.pivotlow(bodyLo, swingLen, swingLen)
+
+var float lastHi = na
+var float prevHi = na
+var int lastHiBar = na
+var float lastLo = na
+var float prevLo = na
+var int lastLoBar = na
+var line hiLine = na
+var line loLine = na
+
+// break state: 1 = a body closed above the swing high, -1 = below the swing low, 0 = inside
+var int breakDir = 0
+var float breakLevel = na
+var int breakBar = na
+var bool retested = false
+var box consBox = na
+
+colUp = color.new(color.teal, 0)
+colDn = color.new(color.red, 0)
+colNeutral = color.new(color.gray, 0)
+clear = color.new(color.gray, 100)
+
+if not na(ph)
+    prevHi := lastHi
+    lastHi := ph
+    lastHiBar := bar_index - swingLen
+    string hiText = na(prevHi) ? "H" : ph > prevHi ? "HH" : "LH"
+    color hiColor = na(prevHi) ? colNeutral : ph > prevHi ? colUp : colDn
+    label.new(bar_index - swingLen, high[swingLen], hiText, style=label.style_label_down, color=clear, textcolor=hiColor, size=size.small)
+    line.delete(hiLine)
+    hiLine := line.new(bar_index - swingLen, ph, bar_index, ph, extend=extend.right, color=color.new(color.red, 45), style=line.style_dashed)
+    // structure has moved on above an upward break: the break is no longer pending
+    if breakDir == 1 and ph > breakLevel
+        breakDir := 0
+
+if not na(pl)
+    prevLo := lastLo
+    lastLo := pl
+    lastLoBar := bar_index - swingLen
+    string loText = na(prevLo) ? "L" : pl > prevLo ? "HL" : "LL"
+    color loColor = na(prevLo) ? colNeutral : pl > prevLo ? colUp : colDn
+    label.new(bar_index - swingLen, low[swingLen], loText, style=label.style_label_up, color=clear, textcolor=loColor, size=size.small)
+    line.delete(loLine)
+    loLine := line.new(bar_index - swingLen, pl, bar_index, pl, extend=extend.right, color=color.new(color.teal, 45), style=line.style_dashed)
+    if breakDir == -1 and pl < breakLevel
+        breakDir := 0
+
+haveRange = not na(lastHi) and not na(lastLo) and lastHi > lastLo
+
+// ───────── events on this candle
+sweepHi = haveRange and breakDir == 0 and high > lastHi and bodyHi <= lastHi
+sweepLo = haveRange and breakDir == 0 and low < lastLo and bodyLo >= lastLo
+breakUp = haveRange and breakDir == 0 and close > lastHi and close[1] <= lastHi
+breakDn = haveRange and breakDir == 0 and close < lastLo and close[1] >= lastLo
+
+fakeUp = breakDir == 1 and bar_index > breakBar and bar_index - breakBar <= fakeBars and close < breakLevel
+fakeDn = breakDir == -1 and bar_index > breakBar and bar_index - breakBar <= fakeBars and close > breakLevel
+backInUp = breakDir == 1 and bar_index - breakBar > fakeBars and close < breakLevel
+backInDn = breakDir == -1 and bar_index - breakBar > fakeBars and close > breakLevel
+retestUp = breakDir == 1 and bar_index > breakBar and not retested and low <= breakLevel and close > breakLevel
+retestDn = breakDir == -1 and bar_index > breakBar and not retested and high >= breakLevel and close < breakLevel
+
+if sweepHi
+    label.new(bar_index, high, "S", style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.black, size=size.tiny, tooltip="Wick above the swing-high body, closed back below: sweep, not a break")
+if sweepLo
+    label.new(bar_index, low, "S", style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.black, size=size.tiny, tooltip="Wick below the swing-low body, closed back above: sweep, not a break")
+
+if breakUp
+    breakDir := 1
+    breakLevel := lastHi
+    breakBar := bar_index
+    retested := false
+    consBox := na
+    label.new(bar_index, high, "B", style=label.style_label_down, color=color.new(color.blue, 10), textcolor=color.white, size=size.tiny, tooltip="Body closed above the swing-high body: break. Wait for the retest.")
+if breakDn
+    breakDir := -1
+    breakLevel := lastLo
+    breakBar := bar_index
+    retested := false
+    consBox := na
+    label.new(bar_index, low, "B", style=label.style_label_up, color=color.new(color.blue, 10), textcolor=color.white, size=size.tiny, tooltip="Body closed below the swing-low body: break. Wait for the retest.")
+
+if fakeUp
+    label.new(bar_index, high, "F", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.tiny, tooltip="Closed back below the broken line within the fakeout window: failed break")
+    breakDir := 0
+if fakeDn
+    label.new(bar_index, low, "F", style=label.style_label_up, color=color.new(color.red, 10), textcolor=color.white, size=size.tiny, tooltip="Closed back above the broken line within the fakeout window: failed break")
+    breakDir := 0
+if backInUp or backInDn
+    breakDir := 0
+
+if retestUp and not fakeUp
+    retested := true
+    label.new(bar_index, low, "R", style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny, tooltip="Came back to the broken line and closed above it: retest held")
+    if showPlan and pipSize > 0
+        float entryUp = close
+        line.new(bar_index, entryUp, bar_index + 25, entryUp, color=color.new(color.white, 0))
+        line.new(bar_index, entryUp - slPips * pipSize, bar_index + 25, entryUp - slPips * pipSize, color=colDn, style=line.style_dashed)
+        line.new(bar_index, entryUp + tp1Pips * pipSize, bar_index + 25, entryUp + tp1Pips * pipSize, color=colUp, style=line.style_dashed)
+        line.new(bar_index, entryUp + tp2Pips * pipSize, bar_index + 25, entryUp + tp2Pips * pipSize, color=colUp, style=line.style_dotted)
+        label.new(bar_index + 25, entryUp, "BUY " + str.tostring(entryUp, format.mintick) + "  stop " + str.tostring(entryUp - slPips * pipSize, format.mintick) + "  T1 " + str.tostring(entryUp + tp1Pips * pipSize, format.mintick), style=label.style_label_left, color=clear, textcolor=colUp, size=size.small)
+if retestDn and not fakeDn
+    retested := true
+    label.new(bar_index, high, "R", style=label.style_label_down, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny, tooltip="Came back to the broken line and closed below it: retest held")
+    if showPlan and pipSize > 0
+        float entryDn = close
+        line.new(bar_index, entryDn, bar_index + 25, entryDn, color=color.new(color.white, 0))
+        line.new(bar_index, entryDn + slPips * pipSize, bar_index + 25, entryDn + slPips * pipSize, color=colDn, style=line.style_dashed)
+        line.new(bar_index, entryDn - tp1Pips * pipSize, bar_index + 25, entryDn - tp1Pips * pipSize, color=colUp, style=line.style_dashed)
+        line.new(bar_index, entryDn - tp2Pips * pipSize, bar_index + 25, entryDn - tp2Pips * pipSize, color=colUp, style=line.style_dotted)
+        label.new(bar_index + 25, entryDn, "SELL " + str.tostring(entryDn, format.mintick) + "  stop " + str.tostring(entryDn + slPips * pipSize, format.mintick) + "  T1 " + str.tostring(entryDn - tp1Pips * pipSize, format.mintick), style=label.style_label_left, color=clear, textcolor=colDn, size=size.small)
+
+// ───────── consolidation box: no body close beyond either line
+inside = haveRange and breakDir == 0 and close <= lastHi and close >= lastLo
+if showBox and inside
+    if na(consBox)
+        consBox := box.new(math.min(lastHiBar, lastLoBar), lastHi, bar_index, lastLo, border_color=color.new(color.yellow, 30), border_style=line.style_dashed, bgcolor=color.new(color.yellow, 93))
+    else
+        box.set_top(consBox, lastHi)
+        box.set_bottom(consBox, lastLo)
+        box.set_right(consBox, bar_index)
+
+// ───────── sessions (local exchange hours, daylight saving handled by TradingView)
+inSession(string hours, string zone) =>
+    timeframe.isintraday and not na(time(timeframe.period, hours, zone))
+bgcolor(showSess and inSession("0900-1800", "Asia/Tokyo") ? color.new(color.purple, 95) : na, title="Tokyo session")
+bgcolor(showSess and inSession("0800-1700", "Europe/London") ? color.new(color.blue, 95) : na, title="London session")
+bgcolor(showSess and inSession("0800-1700", "America/New_York") ? color.new(color.orange, 95) : na, title="New York session")
+
+// ───────── what is happening now, in words
+var table status = table.new(position.top_right, 1, 2, border_width=0)
+if barstate.islast
+    string state = not haveRange ? "Not enough swings yet" : breakDir == 1 ? (retested ? "Broke UP at " + str.tostring(breakLevel, format.mintick) + " — retest held" : "Broke UP at " + str.tostring(breakLevel, format.mintick) + " — WAIT for the retest") : breakDir == -1 ? (retested ? "Broke DOWN at " + str.tostring(breakLevel, format.mintick) + " — retest held" : "Broke DOWN at " + str.tostring(breakLevel, format.mintick) + " — WAIT for the retest") : "Consolidation " + str.tostring(lastLo, format.mintick) + " – " + str.tostring(lastHi, format.mintick) + " — middle = no trade"
+    string swings = not haveRange ? "" : (lastHi > nz(prevHi, lastHi) ? "HH" : lastHi < nz(prevHi, lastHi) ? "LH" : "H") + " / " + (lastLo > nz(prevLo, lastLo) ? "HL" : lastLo < nz(prevLo, lastLo) ? "LL" : "L")
+    table.cell(status, 0, 0, state, text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small, text_halign=text.align_right)
+    table.cell(status, 0, 1, "Last swings: " + swings, text_color=color.silver, bgcolor=color.new(color.black, 30), text_size=size.small, text_halign=text.align_right)
+
+// ───────── alerts
+alertcondition(breakUp, "Body break up", "Body closed above the swing high: wait for the retest")
+alertcondition(breakDn, "Body break down", "Body closed below the swing low: wait for the retest")
+alertcondition(sweepHi or sweepLo, "Wick sweep", "Wick through a line, closed back: sweep")
+alertcondition(fakeUp or fakeDn, "Fakeout", "Break closed back inside: fakeout")
+alertcondition((retestUp and not fakeUp) or (retestDn and not fakeDn), "Retest held", "Retest of the broken line held")

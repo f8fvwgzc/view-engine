@@ -84,13 +84,16 @@ _REG: list[Symbol] = [
     _fx("CADJPY", "Canadian Dollar / Japanese Yen", ("USDJPY", "USDCAD", "WTI", "NIKKEI")),
     _fx("EURGBP", "Euro / British Pound", ("EURUSD", "GBPUSD", "DXY")),
     # ---- metals
-    Symbol("XAUUSD", "Gold spot (GC=F futures candles shifted by live futures-spot basis)", "metal", "GC=F",
+    Symbol("XAUUSD", "Gold spot (XAU/USD)", "metal", "GC=F",
            "xauusd", currencies=("USD",), options_proxy=OptionsProxy("GLD", "direct"),
            related=("DXY", "US10Y", "XAGUSD", "USDJPY", "SPX", "VIX"), spot_code="XAU",
-           notes="Candles: COMEX GC=F minus current basis (GC=F last - live spot from gold-api.com / Swissquote)."),
-    Symbol("XAGUSD", "Silver spot (SI=F futures candles shifted by live futures-spot basis)", "metal", "SI=F",
+           notes="Candles come from the local M1 spot store when it holds XAUUSD (see /history/coverage), with the "
+                 "live feed stitched on for newer candles. Without a store: COMEX GC=F futures minus the "
+                 "futures-spot basis. Latest price: live spot quote (gold-api.com / Swissquote)."),
+    Symbol("XAGUSD", "Silver spot (XAG/USD)", "metal", "SI=F",
            "xagusd", currencies=("USD",), options_proxy=OptionsProxy("SLV", "direct"),
-           related=("XAUUSD", "DXY", "US10Y", "SPX"), spot_code="XAG"),
+           related=("XAUUSD", "DXY", "US10Y", "SPX"), spot_code="XAG",
+           notes="Local M1 spot store when imported; otherwise COMEX SI=F futures minus the futures-spot basis."),
     # ---- dollar index / rates
     Symbol("DXY", "US Dollar Index (ICE)", "index", "DX-Y.NYB", None, currencies=("USD",),
            options_proxy=OptionsProxy("UUP", "direct"),
@@ -201,5 +204,13 @@ _CCYS = {"USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF", "CNH", "CNY", "
          "HKD", "MXN", "ZAR", "TRY", "PLN", "HUF", "CZK", "INR", "KRW", "BRL"}
 
 
+def aliases_of(sym: Symbol) -> list[str]:
+    """Other spellings that resolve to this symbol (lower case), e.g. gold, xau; eur/usd."""
+    out = [k.lower() for k, v in _ALIASES.items() if v == sym.id]
+    if sym.asset_class in ("fx", "metal") and len(sym.id) == 6:
+        out += [f"{sym.id[:3]}/{sym.id[3:]}".lower(), f"{sym.id[:3]} {sym.id[3:]}".lower()]
+    return sorted(dict.fromkeys(out))[:12]
+
+
 def list_symbols() -> list[dict]:
-    return [s.to_dict() for s in _REG]
+    return [{**s.to_dict(), "aliases": aliases_of(s)} for s in _REG]

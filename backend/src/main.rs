@@ -65,12 +65,13 @@ async fn main() {
     let embedder = Embedder::detect(&http, &providers.ollama_url).await;
     let skills = SkillLibrary::load(skills_dir.clone()).await;
     tracing::info!("{} skills in {} (add your own or import from GitHub in Settings → Skills)", skills.len().await, skills_dir.display());
-    let harness = Arc::new(Harness { database: database.clone(), http, providers, skills, embedder, limits: Default::default(), quant: harness::market::Quant::from_env(web::client()) });
+    let harness = Arc::new(Harness { database: database.clone(), http, providers, skills, embedder, limits: Default::default(), quant: harness::market::Quant::from_env(web::client()), rlcd: harness::rlcd::Rlcd::from_env(web::client()) });
 
     harness.refresh_skill_priors().await;
     let state = Arc::new(AppState { database, redis, event_tx, harness, active_runs: Mutex::new(HashMap::new()) });
     tokio::spawn(harness::market::evaluator(state.clone()));
     tokio::spawn(harness::market::watcher(state.clone()));
+    tokio::spawn(harness::rlcd::session_scanner(state.clone()));
     let app = Router::new()
         .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok", "engine": "view-engine"})) }))
         .route("/api/dashboard", get(api::dashboard))
@@ -92,6 +93,15 @@ async fn main() {
         .route("/api/market/retest", get(api::market_retest))
         .route("/api/market/levels", get(api::market_levels))
         .route("/api/market/mtf", get(api::market_mtf))
+        .route("/api/market/chart", get(api::market_chart))
+        .route("/api/rlcd/health", get(api::rlcd_health))
+        .route("/api/rlcd/heads", get(api::rlcd_heads))
+        .route("/api/rlcd/calibration", get(api::rlcd_calibration))
+        .route("/api/rlcd/decide", post(api::rlcd_decide))
+        .route("/api/rlcd/scan", post(api::rlcd_scan))
+        .route("/api/rlcd/bernoulli", get(api::rlcd_bernoulli))
+        .route("/api/rlcd/train", post(api::rlcd_train))
+        .route("/api/rlcd/train/:job", get(api::rlcd_train_status))
         .route("/api/runs/:run_id", get(api::get_run))
         .route("/api/runs/:run_id/cancel", post(api::cancel_run))
         .route("/api/events", get(api::list_events).post(api::ingest_event))

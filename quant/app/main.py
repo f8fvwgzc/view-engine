@@ -284,6 +284,112 @@ def mtf_ep(symbol: str, intervals: str = "4h,1h,15m,5m", pip: Optional[float] = 
         return ok(mtf(normalize(symbol), ivs, pip, sl_pips, tp_pips, tp2_pips, fakeout_max))
 
 
+@app.get("/chart")
+def chart_ep(symbol: str, interval: str = "15m", bars: int = Query(300, ge=50, le=1000),
+             pip: Optional[float] = Query(None, gt=0), sl_pips: float = Query(20, gt=0),
+             tp_pips: float = Query(50, gt=0), tp2_pips: float = Query(100, gt=0), as_of: Optional[str] = AS_OF):
+    """Candles of one interval plus every drawing (swings, boxes, zones, events, impulses, patterns, sessions,
+    news), the playbook and a plain reading with a stated risk rule. Cached per closed candle."""
+    from .chart import chart
+    with replay(as_of):
+        return ok(chart(normalize(symbol), norm_interval(interval), bars, pip, sl_pips, tp_pips, tp2_pips))
+
+
+def _trigger_interval(interval: str) -> str:
+    """Trigger timeframe of /dataset and /features: here '1m' means one minute."""
+    iv = (interval or "").strip().lower()
+    return "1min" if iv in ("1m", "1min") else norm_interval(interval)
+
+
+@app.get("/events/history")
+def events_history(currency: Optional[str] = None, start: Optional[str] = Query(None, alias="from"),
+                   end: Optional[str] = Query(None, alias="to")):
+    """Scheduled high-impact events (official schedules, 2019 -> what is already scheduled)."""
+    from . import events as ev
+    rows = ev.history(currency, start, end)
+    t = ev.load_table()
+    return ok({"count": len(rows), "events": rows, "coverage": ev.coverage(), "report": t.get("report"),
+               "source": "FRED / ALFRED release dates, federalreserve.gov, ecb.europa.eu, boj.or.jp",
+               "as_of": t.get("built")})
+
+
+@app.get("/dataset")
+def dataset_ep(symbol: str, interval: str = "15m", pip: Optional[float] = Query(None, gt=0),
+               sl_pips: float = Query(20, gt=0), tp_pips: float = Query(50, gt=0), tp2_pips: float = Query(100, gt=0),
+               horizon: int = Query(48, ge=1, le=2000), spread_pips: Optional[float] = Query(None, ge=0),
+               max_rows: int = Query(20000, ge=1, le=200000), start: Optional[str] = None, end: Optional[str] = None,
+               format: str = "json", as_of: Optional[str] = AS_OF):
+    """Feature matrix + outcome labels, one row per closed candle. format=json (capped by max_rows) or
+    format=npz (binary, no row cap, cached on disk)."""
+    from fastapi.responses import FileResponse
+
+    from .dataset import dataset, dataset_npz
+    if format not in ("json", "npz"):
+        raise ValueError("format must be json or npz")
+    iv = _trigger_interval(interval)
+    with replay(as_of):
+        if format == "npz":
+            path = dataset_npz(normalize(symbol), iv, pip, sl_pips, tp_pips, tp2_pips, horizon, spread_pips, start,
+                               end)
+            return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+        out = dataset(normalize(symbol), iv, pip, sl_pips, tp_pips, tp2_pips, horizon, spread_pips, max_rows, start,
+                      end)
+        r = replay_as_of()
+        if r is not None:
+            out = {**out, "replay": True, "replay_as_of": iso(r)}
+        return JSONResponse(out)
+
+
+@app.get("/features")
+def features_ep(symbol: str, interval: str = "15m", pip: Optional[float] = Query(None, gt=0),
+                sl_pips: float = Query(20, gt=0), tp_pips: float = Query(50, gt=0),
+                tp2_pips: float = Query(100, gt=0), horizon: int = Query(48, ge=1, le=2000),
+                spread_pips: Optional[float] = Query(None, ge=0), as_of: Optional[str] = AS_OF):
+    from .dataset import features
+    with replay(as_of):
+        out = features(normalize(symbol), _trigger_interval(interval), pip, sl_pips, tp_pips, tp2_pips, horizon,
+                       spread_pips)
+        x = out.pop("x")  # already cleaned exactly like the /dataset rows; keep it bit-identical
+        r = replay_as_of()
+        payload = jsonable({**out, **({"replay": True, "replay_as_of": iso(r)} if r is not None else {})})
+        payload["x"] = x
+        return JSONResponse(payload)
+
+
+@app.post("/history/import")
+def history_import(body: dict):
+    """Start a background import into the local M1 store. Body: {symbols: [...], from_year: 2021,
+    source: "histdata" | "dukascopy" | "folder", tz: "UTC"} (tz = default for drop-folder files)."""
+    from . import m1store
+    source = str(body.get("source", "histdata")).lower()
+    if source not in ("histdata", "dukascopy", "folder"):
+        raise ValueError("source must be histdata, dukascopy or folder")
+    syms = [normalize(x).id for x in (body.get("symbols") or [])]
+    if source != "folder" and not syms:
+        raise ValueError("symbols required")
+    job = m1store.start_import(syms, int(body.get("from_year", 2021)), source, str(body.get("tz", "UTC")))
+    return ok({"job": job, "status": "running", "source": source, "symbols": syms,
+               "as_of": iso(datetime.now(timezone.utc))})
+
+
+@app.get("/history/import/{job}")
+def history_import_job(job: str):
+    from . import m1store
+    j = m1store.jobs.get(job)
+    if j is None:
+        raise DataError(f"unknown import job {job}")
+    return ok({**j, "source": j["source"], "as_of": iso(datetime.now(timezone.utc))})
+
+
+@app.get("/history/coverage")
+def history_coverage(symbol: Optional[str] = None):
+    """Local M1 store coverage: per symbol the sources, first/last minute, rows and gaps longer than a weekend."""
+    from . import m1store
+    cov = m1store.coverage(normalize(symbol).id if symbol else None)
+    return ok({"store": str(m1store.STORE_DIR), "symbols": cov, "count": len(cov),
+               "source": "local M1 store", "as_of": iso(datetime.now(timezone.utc))})
+
+
 @app.get("/history/status")
 def history_status(symbol: str):
     """Dukascopy disk-cache coverage for a symbol (deep intraday history)."""

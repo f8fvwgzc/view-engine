@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Bot, ExternalLink, Maximize2, Play, Plus, Square, Trash2, X } from 'lucide-react'
 import { agentReport, formatTokens, stripJsonBlock, timeLabel, type Project, type RunAgent, type RunDetail, type Prediction, type SwarmEvent, type Task } from '../types'
 import { Markdown } from './Markdown'
-import { ChartThumbs, MarketPack, TradePlanCard } from './Trading'
+import { ChartButton, ChartThumbs, MarketPack, TradePlanCard } from './Trading'
 
 type Props = {
   project: Project | null
@@ -54,6 +54,7 @@ function Inspector({ task, detail, liveEvents, onSelectAgent, prediction, onRun,
       <h3>{task.title}</h3>
       {task.description && <p>{task.description}</p>}
       <ChartThumbs taskId={task.id} />
+      {task.config.symbol && task.config.mode === 'trading' && <ChartButton symbol={task.config.symbol} interval={task.config.routing?.charts?.charts?.[0]?.timeframe ?? (task.config.style === 'swing' ? '4h' : '15m')} asOf={task.config.as_of} />}
       {run?.error && <div className="run-error">{run.error}</div>}
       {run && <div className="tabs"><button className={tab === 'decision' ? 'active' : ''} onClick={() => setTab('decision')}>DECISION</button><button className={tab === 'report' ? 'active' : ''} onClick={() => setTab('report')} disabled={!run.report}>REPORT</button>{run.report && <button className="tab-action" onClick={onOpenReport} title="Open full report"><Maximize2 size={12} /></button>}</div>}
       {run && tab === 'decision' && <>

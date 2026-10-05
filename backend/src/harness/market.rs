@@ -57,6 +57,7 @@ impl Quant {
             for alias in symbol["aliases"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 names.push(alias.to_string());
             }
+            names.extend(common_names(id).iter().map(|name| name.to_string()));
             for name in names {
                 let needle = normalize(&name);
                 if needle.len() < 3 { continue }
@@ -116,6 +117,24 @@ fn parse_candles(value: &Value) -> Vec<(DateTime<Utc>, f64, f64, f64)> {
             Some((time, candle["h"].as_f64()?, candle["l"].as_f64()?, candle["c"].as_f64()?))
         })
         .collect()
+}
+
+/// How charts and people write the instruments the desk trades most ("Gold Spot / U.S. Dollar", "EUR/USD", "cable").
+fn common_names(id: &str) -> &'static [&'static str] {
+    match id {
+        "XAUUSD" => &["GOLD", "XAU"],
+        "XAGUSD" => &["SILVER", "XAG"],
+        "EURUSD" => &["EUR USD", "EURO U S DOLLAR", "EURO US DOLLAR"],
+        "GBPUSD" => &["GBP USD", "BRITISH POUND U S DOLLAR", "BRITISH POUND US DOLLAR", "CABLE"],
+        "USDJPY" => &["USD JPY", "U S DOLLAR JAPANESE YEN", "US DOLLAR JAPANESE YEN"],
+        "GBPJPY" => &["GBP JPY", "BRITISH POUND JAPANESE YEN"],
+        "EURJPY" => &["EUR JPY", "EURO JAPANESE YEN"],
+        "AUDUSD" => &["AUD USD", "AUSTRALIAN DOLLAR U S DOLLAR", "AUSTRALIAN DOLLAR US DOLLAR"],
+        "USDCAD" => &["USD CAD", "U S DOLLAR CANADIAN DOLLAR", "US DOLLAR CANADIAN DOLLAR"],
+        "USDCHF" => &["USD CHF", "U S DOLLAR SWISS FRANC", "US DOLLAR SWISS FRANC"],
+        "NZDUSD" => &["NZD USD", "NEW ZEALAND DOLLAR U S DOLLAR", "NEW ZEALAND DOLLAR US DOLLAR"],
+        _ => &[],
+    }
 }
 
 fn normalize(text: &str) -> String {
@@ -377,6 +396,13 @@ impl Quant {
         self.get("/levels", &query, 240).await
     }
 
+    /// Candles plus every drawing on them (swings, boxes, zones, events, patterns, sessions, news, playbook) and a
+    /// plain reading of what price is doing, what to wait for and how risky it is.
+    pub async fn chart(&self, params: &[(String, String)]) -> Result<Value, String> {
+        let query: Vec<(&str, String)> = params.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+        self.get("/chart", &query, 120).await
+    }
+
     /// Top-down read: per timeframe consolidation box or impulse, wick sweeps that failed to close beyond, and
     /// the playbook that follows (sell zone / buy zone inside a range, retest zone after a close-confirmed break).
     pub async fn mtf(&self, params: &[(String, String)]) -> Result<Value, String> {
@@ -387,6 +413,11 @@ impl Quant {
     /// Backtest of the body-close structure rules over the available history (can take a few seconds).
     pub async fn backtest(&self, symbol: &str, interval: &str) -> Result<Value, String> {
         self.get("/backtest", &[("symbol", symbol.to_string()), ("interval", interval.to_string())], 180).await
+    }
+
+    /// Which FX sessions are open now and when each opened (DST-aware, computed by the sidecar).
+    pub async fn sessions(&self) -> Result<Value, String> {
+        self.get("/sessions", &[], 10).await
     }
 
     pub async fn signals(&self, symbol: &str, intervals: &[String]) -> Result<Value, String> {

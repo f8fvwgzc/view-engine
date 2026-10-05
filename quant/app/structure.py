@@ -103,12 +103,22 @@ def bodies(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 def raw_swings(df: pd.DataFrame, left: int = 2, right: int = 2) -> list[Swing]:
     bh, bl = bodies(df)
     hi, lo = df["h"].to_numpy(float), df["l"].to_numpy(float)
+    n = len(df)
+    if n < left + right + 1:
+        return []
+    win = np.lib.stride_tricks.sliding_window_view
+    i = np.arange(left, n - right)
+    prev_max, prev_min = win(bh, left).max(axis=1)[i - left], win(bl, left).min(axis=1)[i - left]
+    next_max, next_min = win(bh, right).max(axis=1)[i + 1], win(bl, right).min(axis=1)[i + 1]
+    is_h = (bh[i] > prev_max) & (bh[i] >= next_max)
+    is_l = (bl[i] < prev_min) & (bl[i] <= next_min)
     out: list[Swing] = []
-    for i in range(left, len(df) - right):
-        if bh[i] > bh[i - left:i].max() and bh[i] >= bh[i + 1:i + right + 1].max():
-            out.append(Swing("H", i, float(bh[i]), float(hi[i]), i + right))
-        if bl[i] < bl[i - left:i].min() and bl[i] <= bl[i + 1:i + right + 1].min():
-            out.append(Swing("L", i, float(bl[i]), float(lo[i]), i + right))
+    for j in np.flatnonzero(is_h | is_l):
+        k = int(i[j])
+        if is_h[j]:
+            out.append(Swing("H", k, float(bh[k]), float(hi[k]), k + right))
+        if is_l[j]:
+            out.append(Swing("L", k, float(bl[k]), float(lo[k]), k + right))
     return out
 
 
@@ -340,9 +350,10 @@ class Context:
 _TN = {"up": 1, "down": -1, "range": 0}
 
 
-def htf_trend_series(sym: Symbol, htf: str, now: pd.Timestamp) -> pd.Series:
+def htf_trend_series(sym: Symbol, htf: str, now: pd.Timestamp, max_bars: int = 100_000) -> pd.Series:
     s = get_series(sym, htf)
     hdf, hcl, _, _ = closed_frame(s.df, htf, day_close_mode(sym), now)
+    hdf, hcl = hdf.iloc[-max_bars:], hcl[-max_bars:]
     if len(hdf) < 10:
         return pd.Series(dtype=float)
     r = run_structure(hdf)
@@ -350,16 +361,22 @@ def htf_trend_series(sym: Symbol, htf: str, now: pd.Timestamp) -> pd.Series:
 
 
 def build_context(sym: Symbol, interval: str, now: Optional[pd.Timestamp] = None,
-                  max_bars: int = 6000, history_days: Optional[int] = None) -> Context:
+                  max_bars: int = 6000, history_days: Optional[int] = None, with_htf: bool = True) -> Context:
+    """`max_bars` caps the candles analysed (the local M1 store can hold years); `history_days` narrows it to
+    that many days and, without a store, asks the Dukascopy cache for deeper history."""
+    from .data import bars_for_days
     now = now or now_ts()
     series = get_series(sym, interval, history_days)
     df, closes, forming, _ = closed_frame(series.df, interval, day_close_mode(sym), now)
+    if history_days is not None:
+        max_bars = min(max_bars, bars_for_days(interval, history_days))
     df, closes = df.iloc[-max_bars:], closes[-max_bars:]
     if len(df) < 30:
         raise ValueError(f"not enough closed {interval} candles ({len(df)})")
     htf = HTF.get(interval, "1d")
     try:
-        hs = htf_trend_series(sym, htf, now) if htf != interval else pd.Series(dtype=float)
+        hs = htf_trend_series(sym, htf, now, max(len(df) // 3, 600)) if htf != interval and with_htf \
+            else pd.Series(dtype=float)
     except Exception:
         hs = pd.Series(dtype=float)
     return context_from_frame(sym, interval, df, closes, forming, series.source, series.delayed_minutes,

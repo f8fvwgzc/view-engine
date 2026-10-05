@@ -39,3 +39,16 @@ def test_metadata():
 def test_bad(bad):
     with pytest.raises(SymbolError):
         normalize(bad)
+
+
+def test_symbol_list_names_and_aliases():
+    from app.symbols import list_symbols
+    by = {s["id"]: s for s in list_symbols()}
+    gold = by["XAUUSD"]
+    assert gold["name"] == "Gold spot (XAU/USD)" and "futures candles shifted" not in gold["name"]
+    assert "local M1 spot store" in gold["notes"]
+    assert {"gold", "xau", "xau/usd"} <= set(gold["aliases"]) and "eur/usd" in by["EURUSD"]["aliases"]
+    assert "dollar index" not in by["DXY"]["aliases"] and "dollarindex" in by["DXY"]["aliases"]
+    for s in list_symbols():                                        # every alias resolves back to its symbol
+        for a in s["aliases"]:
+            assert normalize(a).id == s["id"], (a, s["id"])

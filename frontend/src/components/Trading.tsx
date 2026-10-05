@@ -1,10 +1,34 @@
-import { FormEvent, useEffect, useState } from 'react'
+import { FormEvent, Suspense, lazy, useEffect, useState } from 'react'
 import { Plus, X } from 'lucide-react'
 import { api, attachmentUrl } from '../api'
-import { timeLabel, type Attachment, type Prediction, type Backtest, type BacktestStats, type PredictionBook, type Run, type TradePlan, type WatchItem } from '../types'
+import { timeLabel, type RlcdDecision, type Attachment, type Prediction, type Backtest, type BacktestStats, type PredictionBook, type Run, type TradePlan, type WatchItem } from '../types'
 import { Markdown } from './Markdown'
 
 const pct = (value: number | null | undefined) => typeof value === 'number' ? `${Math.round(value * 100)}%` : '–'
+
+const ChartView = lazy(() => import('./ChartView'))
+
+/** Opens View Engine's own annotated chart of an instrument: zones, HH/HL/LH/LL, boxes, sweeps, the reading. */
+export function ChartButton({ symbol, interval, asOf, label = 'DRAW IT ON THE CHART' }: { symbol: string; interval?: string; asOf?: string; label?: string }) {
+  const [open, setOpen] = useState(false)
+  return <>
+    <button type="button" className="chart-open" onClick={() => setOpen(true)}>{label}</button>
+    {open && <Suspense fallback={null}><ChartView symbol={symbol} initialInterval={interval} asOf={asOf} onClose={() => setOpen(false)} /></Suspense>}
+  </>
+}
+
+/** RLCD's calibrated call: which action reaches its target before its stop from the latest M15 close. */
+export function RlcdBlock({ decision }: { decision: RlcdDecision }) {
+  const probabilities = decision.probabilities ?? {}
+  const rows: [string, string, number | undefined][] = [['buy', 'BUY', probabilities.buy], ['sell', 'SELL', probabilities.sell], ['hold', 'NEITHER', probabilities.hold]]
+  return <div className={`rlcd ${decision.action ?? 'hold'}`}>
+    <div className="rlcd-head"><b>RLCD MODEL</b><span className="direction-pill">{(decision.action ?? 'hold').toUpperCase()}</span><em>{decision.tier === 'act' ? 'act' : decision.tier === 'confirm' ? 'wait for the trigger candle' : 'no trade'}</em><small>{decision.model}</small></div>
+    <div className="rlcd-bars">{rows.map(([key, label, value]) => <div key={key} className={key}><span>{label}</span><i><u style={{ width: pct(value) }} /></i><small>{pct(value)}</small></div>)}</div>
+    <p><span>BREAKEVEN</span>{pct(decision.breakeven_probability)} needed · confidence {decision.confidence?.toFixed(2) ?? '–'}{decision.expected_r ? ` · expected R buy ${decision.expected_r.buy?.toFixed(2) ?? '–'} / sell ${decision.expected_r.sell?.toFixed(2) ?? '–'}` : ''}</p>
+    {decision.action && decision.action !== 'hold' && typeof decision.entry === 'number' && <p><span>LEVELS</span>entry {decision.entry} · stop {decision.stop} · targets {decision.targets?.join(' / ')}</p>}
+    {decision.warnings?.map((warning, index) => <p key={index} className="rlcd-warning">{warning}</p>)}
+  </div>
+}
 
 /** Head trader's plan: direction, calibrated probability, levels with reward/risk, timing, scenarios. */
 /** Head trader's plan. A WAIT plan shows its range and the two conditional triggers instead of pretending to be a trade. */
@@ -60,7 +84,7 @@ export function TradePlanCard({ plan, run, prediction, asOf }: { plan: TradePlan
       <b>{item.action === 'hold' ? 'HOLD' : item.action === 'sell' ? 'SELL' : 'BUY'}</b>
       <div>
         <p className="case-when">{item.when}</p>
-        {(typeof item.entry === 'number' || typeof item.stop === 'number' || item.targets?.length) ? <p className="case-levels">{typeof item.entry === 'number' && <>entry <i>{item.entry}</i></>}{typeof item.stop === 'number' && <> stop <i>{item.stop}</i></>}{item.targets?.length ? <> targets <i>{item.targets.join(' / ')}</i></> : null}</p> : null}
+        {(item.entry || item.stop || item.targets?.length) ? <p className="case-levels">{item.entry ? <>entry <i>{item.entry}</i></> : null}{item.stop ? <> stop <i>{item.stop}</i></> : null}{item.targets?.length ? <> targets <i>{item.targets.join(' / ')}</i></> : null}</p> : null}
         {item.reason && <p><span>WHY</span>{item.reason}</p>}
         {item.risk && <p><span>RISK</span>{item.risk}</p>}
       </div>
@@ -74,6 +98,7 @@ export function TradePlanCard({ plan, run, prediction, asOf }: { plan: TradePlan
     {plan.key_events?.length ? <div className="event-chips">{plan.key_events.map((event) => <span key={event}>{event}</span>)}</div> : null}
     {plan.scenarios?.length ? <div className="scenarios">{plan.scenarios.map((scenario) => <div key={scenario.name}><b>{scenario.name}</b><i style={{ width: pct(scenario.probability) }} /><small>{pct(scenario.probability)}</small>{scenario.path && <p>{scenario.path}</p>}</div>)}</div> : null}
     {plan.invalidation && <p><span>INVALIDATION</span>{plan.invalidation}</p>}
+    {run.market?.rlcd && <RlcdBlock decision={run.market.rlcd} />}
     {model?.prob_up !== undefined && <p className="model-line"><span>ML MODEL</span>P(up) {pct(model.prob_up)}{model.validation?.accuracy !== undefined ? ` · walk-forward accuracy ${pct(model.validation.accuracy)} vs baseline ${pct(model.validation.baseline_accuracy)}` : ''}</p>}
     {prediction && <p className={`prediction-status ${prediction.outcome ?? 'pending'}`}><span>{asOf ? 'WHAT HAPPENED' : 'TRACKING'}</span>{prediction.outcome
       ? `${({ flat: 'stayed in range (wait was right)', target: 'target hit', stop: 'stopped out', correct: 'direction right, target not reached', wrong: 'wrong' } as Record<string, string>)[prediction.outcome] ?? prediction.outcome} · ${prediction.return_pct?.toFixed(2)}% over ${prediction.horizon_hours}h`
@@ -114,6 +139,11 @@ function Watchlist({ projectId }: { projectId: string }) {
     setTopDown({ symbol })
     try { setTopDown({ symbol, markdown: (await api.mtf(symbol, pip, 20, 50)).markdown ?? 'No read returned.' }) } catch (caught) { setTopDown({ symbol, error: caught instanceof Error ? caught.message : String(caught) }) }
   }
+  const [quick, setQuick] = useState<{ symbol: string; decision?: RlcdDecision; error?: string } | null>(null)
+  async function runQuick(symbol: string) {
+    setQuick({ symbol })
+    try { setQuick({ symbol, decision: await api.rlcdDecide(symbol) }) } catch (caught) { setQuick({ symbol, error: caught instanceof Error ? caught.message : String(caught) }) }
+  }
   const [lines, setLines] = useState<{ symbol: string; markdown?: string; error?: string } | null>(null)
   async function runLines(symbol: string) {
     setLines({ symbol })
@@ -140,9 +170,15 @@ function Watchlist({ projectId }: { projectId: string }) {
     </form>
     {items.map((item) => <div key={item.id} className="watch-row" title={item.last_error ?? (item.last_checked_at ? `checked ${timeLabel(item.last_checked_at)}` : 'waiting for first check')}>
       <i className={`roster-dot ${item.last_error ? 'failed' : item.last_checked_at ? 'running' : 'pending'}`} /><b>{item.symbol}</b>
-      <small>{item.intervals.map((interval) => <button key={interval} className="backtest-link" onClick={() => void runBacktest(item.symbol, interval)} title={`Backtest the structure rules on ${item.symbol} ${interval}`}>{interval} ⟲</button>)}<button className="backtest-link" onClick={() => void runRetest(item.symbol, item.symbol.includes('XAU') ? 0.1 : item.symbol.includes('JPY') ? 0.01 : 0.0001, 20, 50)} title="Retest lab: break → retest → continue with fixed-pip stop and target">retest</button><button className="backtest-link" onClick={() => void runTopDown(item.symbol, item.symbol.includes('XAU') ? 0.1 : item.symbol.includes('JPY') ? 0.01 : 0.0001)} title="Top-down read: H4 context → H1 setup → M15/M5 trigger, range or break, sell zone / buy zone">top-down</button><button className="backtest-link" onClick={() => void runLines(item.symbol)} title="Lines and reactions: zones, touches, hold-vs-break odds, M15 → H1 → H4">lines</button></small>
+      <small>{item.intervals.map((interval) => <button key={interval} className="backtest-link" onClick={() => void runBacktest(item.symbol, interval)} title={`Backtest the structure rules on ${item.symbol} ${interval}`}>{interval} ⟲</button>)}<button className="backtest-link" onClick={() => void runRetest(item.symbol, item.symbol.includes('XAU') ? 0.1 : item.symbol.includes('JPY') ? 0.01 : 0.0001, 20, 50)} title="Retest lab: break → retest → continue with fixed-pip stop and target">retest</button><ChartButton symbol={item.symbol} label="chart" /><button className="backtest-link" onClick={() => void runQuick(item.symbol)} title="RLCD: calibrated buy / sell / hold from the latest M15 close, stop 20 pips, targets 50 and 100 pips — no agents, answers in seconds">rlcd</button><button className="backtest-link" onClick={() => void runTopDown(item.symbol, item.symbol.includes('XAU') ? 0.1 : item.symbol.includes('JPY') ? 0.01 : 0.0001)} title="Top-down read: H4 context → H1 setup → M15/M5 trigger, range or break, sell zone / buy zone">top-down</button><button className="backtest-link" onClick={() => void runLines(item.symbol)} title="Lines and reactions: zones, touches, hold-vs-break odds, M15 → H1 → H4">lines</button></small>
       <button onClick={() => void api.deleteWatch(item.id).then(load)} aria-label={`Stop watching ${item.symbol}`}><X size={11} /></button>
     </div>)}
+    {quick && <div className="backtest-card">
+      <div className="backtest-head"><b>RLCD · {quick.symbol} M15</b><button onClick={() => setQuick(null)} aria-label="Close"><X size={11} /></button></div>
+      {!quick.decision && !quick.error && <p className="empty">Asking the model…</p>}
+      {quick.error && <p className="run-error">{quick.error}</p>}
+      {quick.decision && <RlcdBlock decision={quick.decision} />}
+    </div>}
     {topDown && <div className="backtest-card">
       <div className="backtest-head"><b>TOP-DOWN · {topDown.symbol}</b><button onClick={() => setTopDown(null)} aria-label="Close"><X size={11} /></button></div>
       {!topDown.markdown && !topDown.error && <p className="empty">Reading H4, then H1, then M15 and M5…</p>}
