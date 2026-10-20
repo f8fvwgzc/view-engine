@@ -1,5 +1,13 @@
 # View Engine
 
+**View Engine is a local AI research and trading desk.** Ask a question and an orchestrator hires a team of AI
+agents to research it on your own Claude Code subscription; drop a TradingView chart and it reads the structure
+(HH/HL/LH/LL, consolidation, support and resistance, sweeps and fakeouts), draws it, and gives a buy / sell / hold
+call from **RLCD**, a calibrated decision model trained on years of gold and FX history.
+
+Website: <https://f8fvwgzc.github.io/view-engine/> · Not financial advice: the model reports its own track record,
+and on current data that record says "hold".
+
 A local research engine. Create a project, ask a question, and a single **orchestrator** hires a team of
 specialist agents for it, wires them into a dependency graph, lets them research the open web and exchange
 findings, and returns a **decision-ready strategy** with sources. You watch the team being born, talking and

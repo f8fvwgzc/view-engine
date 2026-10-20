@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>View Engine — AI research and trading desk with calibrated decisions</title>
+<meta name="description" content="View Engine is an open-source, local AI research and trading desk. An orchestrator hires agent teams on your own Claude Code subscription; for gold and FX it reads chart structure, draws it, and gives a buy / sell / hold call from RLCD, a calibrated decision model.">
+<link rel="canonical" href="https://f8fvwgzc.github.io/view-engine/">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="website">
+<meta property="og:title" content="View Engine — AI research and trading desk">
+<meta property="og:description" content="Agent teams on your own Claude Code subscription, annotated gold and FX charts, and RLCD: a calibrated buy / sell / hold model that reports its own track record.">
+<meta property="og:url" content="https://f8fvwgzc.github.io/view-engine/">
+<meta property="og:image" content="https://f8fvwgzc.github.io/view-engine/assets/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="View Engine — AI research and trading desk">
+<meta name="twitter:description" content="Agent teams, annotated charts and a calibrated buy / sell / hold model. Open source, runs locally.">
+<meta name="twitter:image" content="https://f8fvwgzc.github.io/view-engine/assets/social-preview.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230d0f0e'/%3E%3Cpath d='M6 22l6-8 5 5 9-11' stroke='%239fe0ae' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "View Engine",
+  "description": "Local AI research and trading desk: an orchestrator hires agent teams on your Claude Code subscription; RLCD, a calibrated buy / sell / hold model; annotated gold and FX charts.",
+  "codeRepository": "https://github.com/f8fvwgzc/view-engine",
+  "url": "https://f8fvwgzc.github.io/view-engine/",
+  "programmingLanguage": ["Rust", "TypeScript", "Python"],
+  "license": "https://opensource.org/licenses/MIT",
+  "keywords": "AI agents, multi-agent, Claude Code, trading, forex, XAUUSD, technical analysis, calibration, machine learning"
+}
+</script>
+<style>
+  :root {
+    --bg: #0b0d0c; --panel: #111412; --line: #262b27; --text: #e7ece7; --muted: #8f9a90; --soft: #c9d1ca;
+    --green: #9fe0ae; --red: #f2a3a3; --gold: #c9b979; --blue: #8fb4ff;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    --mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--sans); }
+  a { color: var(--green); }
+  .wrap { width: min(1080px, 100%); margin: 0 auto; padding: 0 16px; }
+  header.site { display: flex; align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+  header.site b { font: 700 15px var(--mono); letter-spacing: .12em; }
+  header.site nav { margin-left: auto; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.site nav a { color: var(--muted); text-decoration: none; font: 13px var(--mono); }
+  header.site nav a:hover { color: var(--text); }
+  .hero { padding: 64px 0 36px; }
+  .eyebrow { margin: 0 0 14px; color: var(--muted); font: 12px var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+  h1 { margin: 0; max-width: 820px; font-size: clamp(30px, 5vw, 50px); line-height: 1.12; font-weight: 600; letter-spacing: -.01em; }
+  .lede { max-width: 720px; margin: 20px 0 28px; color: var(--soft); font-size: 18px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .button { display: inline-block; padding: 11px 18px; border: 1px solid #3f6b49; background: #0f1a12; color: var(--text); text-decoration: none; font: 600 13px var(--mono); letter-spacing: .08em; }
+  .button.ghost { border-color: var(--line); background: transparent; color: var(--soft); }
+  figure { margin: 0 0 12px; border: 1px solid var(--line); background: #0d0f0e; }
+  figure img { display: block; width: 100%; height: auto; }
+  figcaption { padding: 10px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  section { padding: 44px 0; border-top: 1px solid var(--line); }
+  h2 { margin: 0 0 18px; font-size: 24px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card { padding: 18px; border: 1px solid var(--line); background: var(--panel); }
+  .card h3 { margin: 0 0 8px; font-size: 16px; }
+  .card p { margin: 0; color: var(--soft); font-size: 15px; }
+  .tag { display: inline-block; margin-bottom: 10px; color: var(--muted); font: 11px var(--mono); letter-spacing: .14em; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font: 14px var(--mono); }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 400; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .note { color: var(--muted); font-size: 14px; max-width: 760px; }
+  pre { margin: 0; padding: 16px; overflow-x: auto; border: 1px solid var(--line); background: var(--panel); font: 14px/1.6 var(--mono); color: var(--soft); }
+  ul.plain { margin: 0; padding-left: 20px; color: var(--soft); }
+  ul.plain li { margin: 6px 0; }
+  footer { padding: 30px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  @media (max-width: 640px) { .hero { padding: 40px 0 24px; } .lede { font-size: 16px; } header.site nav { gap: 12px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <b>VIEW ENGINE</b>
+    <nav aria-label="Page sections">
+      <a href="#what">What it does</a>
+      <a href="#rlcd">RLCD</a>
+      <a href="#run">Run it</a>
+      <a href="https://github.com/f8fvwgzc/view-engine">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <p class="eyebrow">Open source · runs on your machine</p>
+      <h1>View Engine: an AI research and trading desk that shows its work.</h1>
+      <p class="lede">Ask a question and an orchestrator hires a team of AI agents to research it on your own Claude Code subscription. Drop a TradingView chart and it reads the structure, draws it, and gives a buy / sell / hold call from RLCD, a calibrated decision model that reports its own track record.</p>
+      <div class="actions">
+        <a class="button" href="https://github.com/f8fvwgzc/view-engine">View the code on GitHub</a>
+        <a class="button ghost" href="#run">Run it locally</a>
+      </div>
+    </div>
+
+    <figure>
+      <img src="assets/chart.svg" width="1058" height="681" alt="View Engine's annotated gold chart on the 1-hour timeframe: candles with HH, HL, LH and LL swing labels, consolidation boxes for 1h and 4h, support and resistance zones, sweep, break and retest markers, news lines and a sell plan with stop and targets.">
+      <figcaption>Gold (XAUUSD), 1-hour, drawn by View Engine: body-close swings, consolidation boxes, support and resistance zones, sweeps (S), breaks (B), retests (R), news and the plan.</figcaption>
+    </figure>
+
+    <section id="what">
+      <h2>What it does</h2>
+      <div class="grid">
+        <div class="card"><span class="tag">RESEARCH</span><h3>An agent team per question</h3><p>A single orchestrator hires researchers, analysts, a strategist and a critic, wires them into a dependency graph and returns a decision with sources. You watch them work live.</p></div>
+        <div class="card"><span class="tag">JUST ASK</span><h3>Understands what you want</h3><p>Paste a chart and ask "long or short now?". It works out whether you want a position or research, a day trade or a swing, and reads the instrument from the chart header.</p></div>
+        <div class="card"><span class="tag">CHART</span><h3>Structure drawn for you</h3><p>HH / HL / LH / LL by candle bodies, consolidation boxes across timeframes, support and resistance zones, sweeps, fakeouts and retests, sessions and three-star news.</p></div>
+        <div class="card"><span class="tag">DAY TRADE</span><h3>Top-down plan with fixed risk</h3><p>H4 context, H1 setup, M15/M5 trigger. Every plan has a sell case, a buy case and a hold case with reasons, a 20-pip stop and 50/100-pip targets.</p></div>
+      </div>
+    </section>
+
+    <section id="rlcd">
+      <h2>RLCD: a calibrated decision model, with honest numbers</h2>
+      <p class="note">RLCD answers typed questions with probabilities instead of text. It is trained on gold since 2019 and nine FX pairs since 2021, and every number it reports comes from the most recent 20% of history, which it never trained on. A Bernoulli gate keeps it at "hold" until those held-back trades beat breakeven.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Entry timeframe</th><th>Trades on held-back history</th><th>Win rate</th><th>Breakeven</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr><td>H1</td><td>47</td><td>19.1%</td><td>30.0%</td><td>hold</td></tr>
+            <tr><td>M15</td><td>8</td><td>50.0%</td><td>30.5%</td><td>hold (too few trades)</td></tr>
+            <tr><td>M5</td><td>811</td><td>28.4%</td><td>31.9%</td><td>hold</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">So today it says hold: with a 20-pip stop, structure, sessions, news timing and classic patterns predict how far price moves, not which way. The model is built to tell you that rather than guess.</p>
+    </section>
+
+    <section id="run">
+      <h2>Run it</h2>
+      <pre><code>git clone https://github.com/f8fvwgzc/view-engine.git
+cd view-engine
+make dev</code></pre>
+      <p class="note">Needs Docker, Rust, Node 22+, uv and a logged-in Claude Code CLI. The UI opens on localhost:5173. No API billing: agents use your own CLI subscription, and all market data comes from free public sources (HistData, Yahoo Finance, gold-api.com, ForexFactory and official central-bank calendars).</p>
+    </section>
+
+    <section>
+      <h2>Built with</h2>
+      <ul class="plain">
+        <li>Rust (axum, sqlx) API with Postgres + pgvector memory and Redis live events</li>
+        <li>React + TypeScript UI with a live agent graph and annotated charts</li>
+        <li>Python quant sidecar (FastAPI) and the RLCD service (scikit-learn, LightGBM, calibrated with CalibratedClassifierCV)</li>
+        <li>A TradingView Pine indicator with the same body-close drawing rules</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    View Engine is MIT-licensed open source. Not financial advice: it is a research tool, and its own model currently says hold.
+    · <a href="https://github.com/f8fvwgzc/view-engine">github.com/f8fvwgzc/view-engine</a>
+  </footer>
+</div>
+</body>
+</html>
