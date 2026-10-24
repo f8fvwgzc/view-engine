@@ -2,11 +2,26 @@ import type { ChartData, RlcdDecision, Backtest, SkillImport, WatchItem, Attachm
 
 const API = import.meta.env.VITE_API_URL ?? ''
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
+// Identical reads in flight at the same time share one network call. Freshness is the browser HTTP cache's job:
+// the API sends Cache-Control and ETags (backend/src/http_cache.rs), so repeat reads are cache hits or bodiless 304s.
+const inflight = new Map<string, Promise<unknown>>()
+
+async function send<T>(path: string, init?: RequestInit): Promise<T> {
+  // Content-Type only with a body: a bare GET stays a "simple" request (no CORS preflight when VITE_API_URL is cross-origin).
+  const headers = init?.body ? { 'Content-Type': 'application/json', ...init.headers } : init?.headers
+  const response = await fetch(`${API}${path}`, { ...init, headers })
   if (!response.ok) throw new Error(`${init?.method ?? 'GET'} ${path} failed: ${response.status} ${await response.text()}`)
   const body = await response.text()
   return (body ? JSON.parse(body) : undefined) as T
+}
+
+function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (init?.method && init.method !== 'GET') return send<T>(path, init)
+  const pending = inflight.get(path)
+  if (pending) return pending as Promise<T>
+  const call = send<T>(path, init).finally(() => inflight.delete(path))
+  inflight.set(path, call)
+  return call
 }
 
 async function upload(taskId: string, files: File[]): Promise<Attachment[]> {

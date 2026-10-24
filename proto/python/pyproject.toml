@@ -1,0 +1,18 @@
+[project]
+name = "view-engine-grpc"
+version = "0.1.0"
+description = "gRPC bridge and cache policy shared by the View Engine Python sidecars (quant, RLCD)"
+requires-python = ">=3.12"
+dependencies = [
+    "grpcio>=1.66",
+    "grpcio-tools>=1.66",
+    "httpx>=0.27",
+    "starlette>=0.37",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["view_engine_grpc"]

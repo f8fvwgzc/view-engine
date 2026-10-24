@@ -1,0 +1,25 @@
+# Routes shared by Caddyfile (containers / production) and Caddyfile.dev (UI from Vite on the host).
+
+(api) {
+	# REST to axum over HTTP/2 cleartext: one multiplexed upstream connection instead of a pool of HTTP/1.1 ones.
+	# Cache-Control and ETag come from the API (backend/src/http_cache.rs) and pass through untouched.
+	handle /api/* {
+		reverse_proxy {$API_UPSTREAM:backend:3001} {
+			transport http {
+				versions h2c
+			}
+		}
+	}
+	# Live event stream. axum 0.7 upgrades WebSockets on HTTP/1.1 only, so this upstream stays on HTTP/1.1.
+	handle /ws {
+		reverse_proxy {$API_UPSTREAM:backend:3001}
+	}
+}
+
+(hardening) {
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}

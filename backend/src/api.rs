@@ -418,7 +418,8 @@ pub async fn get_attachment(Path(id): Path<Uuid>, State(state): State<SharedStat
     let bytes = tokio::fs::read(&path).await.map_err(|_| not_found("Attachment file"))?;
     Ok(axum::response::Response::builder()
         .header(axum::http::header::CONTENT_TYPE, mime)
-        .header(axum::http::header::CACHE_CONTROL, "private, max-age=3600")
+        // An attachment id always names the same bytes (there is no update, only delete): cache it for good.
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=31536000, immutable")
         .body(axum::body::Body::from(bytes))
         .expect("valid response"))
 }

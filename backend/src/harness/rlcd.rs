@@ -4,14 +4,23 @@
 //! for day trades. Everything here degrades gracefully: with RLCD down, routing falls back to keywords and the
 //! desk runs without the model's opinion.
 
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
 
+use crate::{
+    cache::TieredCache,
+    sidecar::{Sidecar, SidecarConfig, SidecarRequest},
+};
+
 pub struct Rlcd {
-    base: String,
-    http: reqwest::Client,
+    sidecar: Sidecar,
+    /// Training jobs already seen finished (their new model has already dropped the cached answers).
+    finished_jobs: std::sync::Mutex<HashSet<String>>,
 }
+
+/// POST routes that only read: their answer depends on the body alone, so they are cached and coalesced.
+const QUERY_ROUTES: &[&str] = &["/v1/systemone", "/v1/decide", "/v1/scan", "/v1/rank"];
 
 /// What a task is asking for, and who decided.
 #[derive(Debug, Clone)]
@@ -32,28 +41,37 @@ const INTENT_CONFIDENCE: f64 = 0.5;
 const STYLE_CONFIDENCE: f64 = 0.3;
 
 impl Rlcd {
-    pub fn from_env(http: reqwest::Client) -> Self {
-        let base = std::env::var("RLCD_URL").ok().filter(|url| !url.trim().is_empty()).unwrap_or_else(|| "http://127.0.0.1:8095".into());
-        Self { base: base.trim_end_matches('/').to_string(), http }
+    /// RLCD_URL (HTTP, default :8095), RLCD_GRPC_URL (gRPC, default :9095, "off" for HTTP only), RLCD_API_KEY.
+    pub async fn from_env(http: reqwest::Client, cache: Option<Arc<TieredCache>>) -> Self {
+        let config = SidecarConfig::from_env("rlcd", "RLCD", "http://127.0.0.1:8095", "http://127.0.0.1:9095");
+        Self { sidecar: Sidecar::new(config, http, cache).await, finished_jobs: Default::default() }
     }
 
-    async fn send(&self, request: reqwest::RequestBuilder, path: &str, timeout_secs: u64) -> Result<Value, String> {
-        let response = request
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
-            .await
-            .map_err(|error| format!("RLCD unreachable at {} ({error}); start it with `make rlcd`", self.base))?;
-        let status = response.status();
-        let value: Value = response.json().await.map_err(|error| format!("RLCD returned invalid JSON: {error}"))?;
+    async fn send(&self, request: SidecarRequest) -> Result<Value, String> {
+        let path = request.path.clone();
+        let (status, body) = self.sidecar.call(request).await.map_err(|error| format!("RLCD unreachable at {} ({error}); start it with `make rlcd`", self.sidecar.url()))?;
+        let value: Value = serde_json::from_slice(&body).map_err(|error| format!("RLCD returned invalid JSON: {error}"))?;
+        let status = reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
         if status.is_success() { Ok(value) } else { Err(format!("rlcd {path} {status}: {}", value["detail"].as_str().map(String::from).unwrap_or_else(|| value.to_string()))) }
     }
 
     pub async fn get(&self, path: &str, query: &[(String, String)], timeout_secs: u64) -> Result<Value, String> {
-        self.send(self.http.get(format!("{}{path}", self.base)).query(query), path, timeout_secs).await
+        let value = self.send(SidecarRequest::get(path, query.to_vec(), timeout_secs)).await?;
+        // A finished training run publishes a new model: every cached answer of the old one is dropped, once per job.
+        if let (Some(job), Some("succeeded" | "partial")) = (path.strip_prefix("/v1/train/"), value["status"].as_str()) {
+            if self.finished_jobs.lock().map(|mut jobs| jobs.insert(job.to_string())).unwrap_or(false) {
+                self.sidecar.invalidate().await;
+            }
+        }
+        Ok(value)
     }
 
     pub async fn post(&self, path: &str, body: &Value, timeout_secs: u64) -> Result<Value, String> {
-        self.send(self.http.post(format!("{}{path}", self.base)).json(body), path, timeout_secs).await
+        let value = self.send(SidecarRequest::post(path, body, timeout_secs, QUERY_ROUTES.contains(&path))).await?;
+        if path == "/v1/train" {
+            self.sidecar.invalidate().await;
+        }
+        Ok(value)
     }
 
     pub async fn health(&self) -> Value {

@@ -1,0 +1,8 @@
+**/target
+**/node_modules
+**/.venv
+**/dist
+.git
+**/.DS_Store
+quant/data
+backend/rlcd/var

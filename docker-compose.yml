@@ -1,6 +1,9 @@
 # Infrastructure for View Engine. For the full research harness (Claude Code / Codex / Copilot CLIs on your
 # own subscriptions) run the backend on the host: `make dev`. The `backend` and `frontend` services below are
 # for container-only setups that use Ollama, an OpenAI-compatible server or the simulated provider.
+# The browser reaches the app through an HTTP/3 edge (Caddy) on https://localhost:${EDGE_PORT:-8443}: `edge` in
+# development (UI from Vite on the host), `frontend` in the containers profile (built UI). Both publish the port on
+# TCP (HTTP/1.1, HTTP/2) and UDP (HTTP/3 over QUIC).
 name: view-engine
 
 services:
@@ -10,6 +13,28 @@ services:
       POSTGRES_DB: viewengine
       POSTGRES_USER: viewengine
       POSTGRES_PASSWORD: viewengine
+    # SSD-era planner costs, no JIT for short OLTP queries, and pg_stat_statements to see which queries need an
+    # index (the migration creates the extension when this library is loaded).
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - jit=off
+      - -c
+      - track_io_timing=on
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U viewengine -d viewengine"]
       interval: 3s
@@ -33,9 +58,29 @@ services:
     volumes:
       - view-engine-redis:/data
 
+  # HTTP/3 edge for `make dev`: proxies /api and /ws to the API on the host and everything else to Vite.
+  edge:
+    profiles: ["dev"]
+    image: caddy:2.10-alpine
+    command: caddy run --config /etc/caddy/Caddyfile.dev --adapter caddyfile
+    environment:
+      EDGE_PORT: ${EDGE_PORT:-8443}
+      API_UPSTREAM: ${API_UPSTREAM:-host.docker.internal:3001}
+      UI_UPSTREAM: ${UI_UPSTREAM:-host.docker.internal:5173}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${EDGE_PORT:-8443}:${EDGE_PORT:-8443}/tcp"
+      - "${EDGE_PORT:-8443}:${EDGE_PORT:-8443}/udp"
+    volumes:
+      - ./edge:/etc/caddy:ro
+      - view-engine-caddy:/data
+
   backend:
     profiles: ["containers"]
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
       DATABASE_URL: postgres://viewengine:viewengine@postgres:5432/viewengine
       REDIS_URL: redis://redis:6379
@@ -55,16 +100,24 @@ services:
     volumes:
       - ./skills:/app/skills
 
+  # Built UI behind the HTTP/3 edge, which also proxies /api (h2c) and /ws to the backend container.
   frontend:
     profiles: ["containers"]
-    build: ./frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     depends_on:
       - backend
     environment:
-      VITE_PROXY_TARGET: http://backend:3001
+      EDGE_PORT: ${EDGE_PORT:-8443}
+      API_UPSTREAM: backend:3001
     ports:
-      - "${FRONTEND_PORT:-5173}:5173"
+      - "${EDGE_PORT:-8443}:${EDGE_PORT:-8443}/tcp"
+      - "${EDGE_PORT:-8443}:${EDGE_PORT:-8443}/udp"
+    volumes:
+      - view-engine-caddy:/data
 
 volumes:
   view-engine-postgres:
   view-engine-redis:
+  view-engine-caddy:

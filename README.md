@@ -25,9 +25,15 @@ Requirements: Docker, Rust, Node 22+, and at least one provider (e.g. `claude` l
 make dev
 ```
 
-This starts Postgres (pgvector, host port 5433) and Redis in Docker, then the API on `http://localhost:3001`,
-the UI on `http://localhost:5173` and the quant sidecar on `http://127.0.0.1:8090` on your machine (needs `uv`). The API runs on the host so it can launch your CLIs.
-URLs are shareable: `?project=…&task=…&agent=…`.
+This starts Postgres (pgvector, host port 5433), Redis and the HTTP/3 edge (Caddy) in Docker, then the API on
+`http://localhost:3001`, the UI on `http://localhost:5173` and the quant sidecar on `http://127.0.0.1:8090` on your
+machine (needs `uv`). The API runs on the host so it can launch your CLIs. Open the app through the edge at
+**`https://localhost:8443`** (HTTP/3, HTTP/2 and HTTP/1.1 on one port; run `make edge-trust` once to trust its local
+certificate). URLs are shareable: `?project=…&task=…&agent=…`.
+
+Transport, caching and database layout are described in
+[ADR 0001](docs/adr/0001-http3-grpc-caching-and-db-indexing.md): browser ⇄ edge over HTTP/3, API ⇄ sidecars over
+gRPC with a two-tier (in-process + Redis) cache, and the index / key / trigger setup of Postgres.
 
 Other targets: `make test`, `make containers` (everything in Docker; Ollama/OpenAI-compatible/simulated only).
 

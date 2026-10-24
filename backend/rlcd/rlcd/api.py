@@ -1,6 +1,7 @@
 """RLCD — FastAPI app.
 
 Run: cd backend/rlcd && uv run uvicorn rlcd.api:app --host 127.0.0.1 --port 8095
+The same routes are served over gRPC on RLCD_GRPC_PORT (default 9095) for the API; see proto/.
 """
 from __future__ import annotations
 
@@ -30,7 +31,22 @@ from .quant import MAJORS, QuantClient, QuantRejected, QuantUnavailable
 from .store import Store, UnknownModel
 from .training import Busy, TrainError, Trainer, parse_time, segment_key
 
+try:
+    from view_engine_grpc import Rule, install_cache_control, serve_grpc
+except ImportError:  # gRPC bridge not installed yet (`uv sync`): plain HTTP without cache policy
+    Rule = install_cache_control = serve_grpc = None
+
 log = logging.getLogger("rlcd")
+# Freshness of each route for the API's service-to-service cache (see proto/python/view_engine_grpc/policy.py).
+# Answers about a market (decide, scan, rank) follow the 15-minute bars loosely; model reports change only when a
+# training run finishes, and the API drops its whole RLCD cache when it sees one finish. Training, feedback and
+# health are never cached (no rule = no-store).
+CACHE_RULES = {
+    "/v1/models": Rule(60, 300, replay=False), "/v1/heads": Rule(60, 300, replay=False),
+    "/v1/calibration": Rule(300, 600, replay=False), "/v1/bernoulli": Rule(300, 600, replay=False),
+    "/v1/systemone": Rule(300, 600, replay=False),
+    "/v1/decide": Rule(15, 15), "/v1/scan": Rule(15, 15), "/v1/rank": Rule(15, 15),
+} if Rule else {}
 SMALL_STOP_ATR = 0.5
 COMPOSITE = P.CompositeConfig()
 
@@ -398,13 +414,14 @@ def segment_summary(v: dict) -> dict:
 
 
 def create_app(home: Optional[Path] = None, quant: Optional[QuantClient] = None,
-               autotrain: Optional[bool] = None) -> FastAPI:
+               autotrain: Optional[bool] = None, grpc: bool = False) -> FastAPI:
+    """`grpc=True` also serves the routes over gRPC (the uvicorn entrypoint below); tests stay HTTP only."""
     svc = Service(home, quant)
     if autotrain is None:
         autotrain = os.environ.get("RLCD_AUTOTRAIN", "1") != "0"
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(app: FastAPI):
         # The intent heads need no market data (their seed set ships with the service): train them on first
         # start so routing works out of the box. Setup heads are trained explicitly via /v1/train.
         if autotrain:
@@ -415,11 +432,16 @@ def create_app(home: Optional[Path] = None, quant: Optional[QuantClient] = None,
                     svc.trainer.start(TrainRequest(heads=missing))
                 except Exception:
                     log.exception("autotrain of the intent heads failed to start")
+        server = await serve_grpc(app, "RLCD_GRPC_PORT", 9095) if grpc and serve_grpc else None
         yield
+        if server is not None:
+            await server.stop(grace=5)
 
     app = FastAPI(title="RLCD — Reinforcement Learning Calibrated Decision", version=VERSION, lifespan=lifespan,
                   description="Typed decisions with calibrated probabilities. Not financial advice.")
     app.state.svc = svc
+    if install_cache_control:
+        install_cache_control(app, CACHE_RULES)
 
     # ------------------------------------------------------------------ errors and auth
     @app.exception_handler(ContractError)
@@ -738,4 +760,4 @@ def create_app(home: Optional[Path] = None, quant: Optional[QuantClient] = None,
     return app
 
 
-app = create_app()
+app = create_app(grpc=True)

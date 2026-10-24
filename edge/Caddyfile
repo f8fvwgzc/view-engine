@@ -1,0 +1,35 @@
+# HTTP/3 edge for View Engine (containers / production): serves the built UI and proxies the API.
+#
+# Browsers connect with HTTP/3 (QUIC, UDP) when they can and fall back to HTTP/2 or HTTP/1.1 over TCP on the same
+# port; Caddy advertises h3 with Alt-Svc. For `localhost` Caddy issues a certificate from its own local CA
+# (`make edge-trust`); for a public SITE_ADDRESS it gets one from Let's Encrypt (then use EDGE_PORT=443 and also
+# publish port 80). See docs/adr/0001-http3-grpc-caching-and-db-indexing.md.
+
+{
+	# Listen on the same port that is published, so the Alt-Svc advertisement (h3=":<port>") points at it.
+	https_port {$EDGE_PORT:8443}
+	http_port {$EDGE_HTTP_PORT:8080}
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+import api.caddy
+
+{$SITE_ADDRESS:localhost} {
+	encode zstd gzip
+	import hardening
+	import api
+
+	handle {
+		root * /srv
+		# Vite fingerprints everything under /assets: the name changes when the content does.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		# index.html and the rest: always revalidated, so a deploy is picked up on the next load.
+		header ?Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,10 +1,12 @@
 """View Engine quant sidecar — FastAPI app.
 
 Run: cd quant && uv run uvicorn app.main:app --host 127.0.0.1 --port 8090
+The same routes are served over gRPC on QUANT_GRPC_PORT (default 9090) for the API; see proto/.
 """
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -25,8 +27,37 @@ from .symbols import SymbolError, list_symbols, normalize
 VERSION = "0.1.0"
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-app = FastAPI(title="View Engine Quant Sidecar", version=VERSION,
+try:
+    from view_engine_grpc import Rule, install_cache_control, serve_grpc
+except ImportError:  # gRPC bridge not installed yet (`uv sync`): plain HTTP without cache policy
+    Rule = install_cache_control = serve_grpc = None
+
+# Freshness of each route for the API's service-to-service cache (see proto/python/view_engine_grpc/policy.py).
+# Kept at or under the in-process TTLs of app/cache.py so the two layers never serve older data than either alone.
+CACHE_RULES = {
+    "/symbols": Rule(3600, 86400, replay=False),
+    "/ohlc": Rule(30, 60), "/price": Rule(5, 10),
+    "/analysis": Rule(30, 60), "/snapshot": Rule(30, 90), "/structure": Rule(30, 60),
+    "/structure/model": Rule(300, 600), "/signals": Rule(20, 20), "/predict": Rule(60, 120),
+    "/mtf": Rule(30, 60), "/levels": Rule(30, 60), "/chart": Rule(15, 45), "/retest": Rule(60, 120),
+    "/session-story": Rule(60, 120), "/backtest": Rule(600, 1800), "/backtest/matrix": Rule(600, 1800),
+    "/correlation": Rule(300, 600), "/calendar": Rule(1800, 3600, replay=False),
+    "/sessions": Rule(60, 60, replay=False), "/options": Rule(300, 300), "/events/history": Rule(300, 600),
+} if Rule else {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    server = await serve_grpc(app, "QUANT_GRPC_PORT", 9090) if serve_grpc else None
+    yield
+    if server is not None:
+        await server.stop(grace=5)
+
+
+app = FastAPI(title="View Engine Quant Sidecar", version=VERSION, lifespan=lifespan,
               description="Free market data + quant analytics + ML probabilities. Not financial advice.")
+if install_cache_control:
+    install_cache_control(app, CACHE_RULES)
 
 
 def ok(payload: dict) -> JSONResponse:

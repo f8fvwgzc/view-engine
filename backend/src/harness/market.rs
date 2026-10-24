@@ -1,42 +1,46 @@
 //! Trading desk: client for the Python quant sidecar (`quant/`, free market data + indicators + options
-//! positioning + ML) and the prediction ledger that scores every trade plan after its horizon.
+//! positioning + ML) and the prediction ledger that scores every trade plan after its horizon. Calls go over gRPC
+//! (HTTP fallback) through the service-to-service cache, see `crate::sidecar`.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::{
+    cache::TieredCache,
+    sidecar::{Sidecar, SidecarConfig, SidecarRequest},
+};
+
 pub struct Quant {
-    base: String,
-    http: reqwest::Client,
+    sidecar: Sidecar,
 }
 
 impl Quant {
-    pub fn from_env(http: reqwest::Client) -> Self {
-        let base = std::env::var("QUANT_URL").ok().filter(|url| !url.trim().is_empty()).unwrap_or_else(|| "http://127.0.0.1:8090".into());
-        Self { base: base.trim_end_matches('/').to_string(), http }
+    /// QUANT_URL (HTTP, default :8090), QUANT_GRPC_URL (gRPC, default :9090, "off" for HTTP only).
+    pub async fn from_env(http: reqwest::Client, cache: Option<Arc<TieredCache>>) -> Self {
+        let config = SidecarConfig::from_env("quant", "QUANT", "http://127.0.0.1:8090", "http://127.0.0.1:9090");
+        Self { sidecar: Sidecar::new(config, http, cache).await }
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)], timeout_secs: u64) -> Result<Value, String> {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .query(query)
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
+        let query = query.iter().map(|(key, value)| (key.to_string(), value.clone())).collect();
+        let (status, body) = self
+            .sidecar
+            .call(SidecarRequest::get(path, query, timeout_secs))
             .await
-            .map_err(|error| format!("quant sidecar unreachable at {} ({error}); start it with `make quant`", self.base))?;
-        let status = response.status();
-        let value: Value = response.json().await.map_err(|error| format!("quant sidecar returned invalid JSON: {error}"))?;
+            .map_err(|error| format!("quant sidecar unreachable at {} ({error}); start it with `make quant`", self.sidecar.url()))?;
+        let value: Value = serde_json::from_slice(&body).map_err(|error| format!("quant sidecar returned invalid JSON: {error}"))?;
+        let status = reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
         if status.is_success() { Ok(value) } else { Err(format!("quant {path} {status}: {}", value["detail"].as_str().unwrap_or(&value.to_string()))) }
     }
 
     pub async fn health(&self) -> Value {
         match self.get("/health", &[], 3).await {
-            Ok(value) => json!({"available": true, "url": self.base, "health": value}),
-            Err(error) => json!({"available": false, "url": self.base, "detail": error}),
+            Ok(value) => json!({"available": true, "url": self.sidecar.url(), "health": value}),
+            Err(error) => json!({"available": false, "url": self.sidecar.url(), "detail": error}),
         }
     }
 

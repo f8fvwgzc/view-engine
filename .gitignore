@@ -34,3 +34,6 @@ backend/rlcd/var/
 skills/*
 !skills/README.md
 quant/data/
+
+# local CA certificate of the HTTP/3 edge (`make edge-trust`)
+.edge-root.crt

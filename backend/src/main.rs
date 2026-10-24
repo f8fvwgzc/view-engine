@@ -2,8 +2,11 @@
 //! and turns their web research into a decision-ready strategy. See `harness/` for the engine.
 
 mod api;
+mod cache;
 mod events;
 mod harness;
+mod http_cache;
+mod sidecar;
 
 use std::{collections::HashMap, env, path::PathBuf, sync::{atomic::AtomicBool, Arc}};
 
@@ -47,6 +50,9 @@ async fn main() {
 
     let database = PgPoolOptions::new()
         .max_connections(20)
+        .min_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .idle_timeout(std::time::Duration::from_secs(600))
         .connect(&database_url)
         .await
         .expect("Postgres is required. Start it with `docker compose up -d postgres redis`.");
@@ -65,7 +71,14 @@ async fn main() {
     let embedder = Embedder::detect(&http, &providers.ollama_url).await;
     let skills = SkillLibrary::load(skills_dir.clone()).await;
     tracing::info!("{} skills in {} (add your own or import from GitHub in Settings → Skills)", skills.len().await, skills_dir.display());
-    let harness = Arc::new(Harness { database: database.clone(), http, providers, skills, embedder, limits: Default::default(), quant: harness::market::Quant::from_env(web::client()), rlcd: harness::rlcd::Rlcd::from_env(web::client()) });
+    // Service-to-service cache for quant and RLCD answers (in process + Redis); SIDECAR_CACHE=off disables it.
+    let sidecar_cache = match env::var("SIDECAR_CACHE").map(|value| value.to_ascii_lowercase()) {
+        Ok(value) if matches!(value.as_str(), "off" | "0" | "false") => None,
+        _ => Some(Arc::new(cache::TieredCache::new(&redis).await)),
+    };
+    let quant = harness::market::Quant::from_env(web::client(), sidecar_cache.clone()).await;
+    let rlcd = harness::rlcd::Rlcd::from_env(web::client(), sidecar_cache).await;
+    let harness = Arc::new(Harness { database: database.clone(), http, providers, skills, embedder, limits: Default::default(), quant, rlcd });
 
     harness.refresh_skill_priors().await;
     let state = Arc::new(AppState { database, redis, event_tx, harness, active_runs: Mutex::new(HashMap::new()) });
@@ -112,6 +125,8 @@ async fn main() {
         .route("/api/settings", get(api::get_settings).put(api::put_settings))
         .route("/api/providers", get(api::list_providers))
         .route("/ws", get(events::websocket_handler))
+        // Cache-Control + ETag on API reads (304 when the browser already has the body); see http_cache.rs.
+        .layer(axum::middleware::from_fn(http_cache::layer))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET, Method::POST, Method::PATCH, Method::PUT, Method::DELETE]).allow_headers(Any))
         .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())

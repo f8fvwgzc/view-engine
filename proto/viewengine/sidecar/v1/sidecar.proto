@@ -1,0 +1,46 @@
+// Service-to-service contract between the View Engine API (Rust) and its Python sidecars (quant, RLCD).
+//
+// One RPC carries any sidecar route: the sidecar replays the call into its own FastAPI app in-process, so
+// routes, validation, error handlers and auth live in one place and are served identically over HTTP and gRPC.
+// What gRPC adds over the old per-request HTTP/1.1 JSON calls: one long-lived multiplexed HTTP/2 channel per
+// sidecar, deadlines that propagate (grpc-timeout), gzip on the wire, keepalive, and cache metadata (the
+// sidecar declares freshness with Cache-Control, the API caches by it and revalidates with the ETag).
+// See docs/adr/0001-http3-grpc-caching-and-db-indexing.md.
+syntax = "proto3";
+
+package viewengine.sidecar.v1;
+
+service Sidecar {
+  rpc Call(CallRequest) returns (CallResponse);
+}
+
+message QueryParam {
+  string key = 1;
+  string value = 2;
+}
+
+message CallRequest {
+  // "GET" or "POST".
+  string method = 1;
+  // Route path of the sidecar, e.g. "/snapshot" or "/v1/decide". Must start with a single "/".
+  string path = 2;
+  // Query string, order preserved, repeated keys allowed.
+  repeated QueryParam query = 3;
+  // JSON request body (POST routes); empty for GET.
+  bytes body = 4;
+  // ETag of the copy the caller already holds. When the fresh answer has the same ETag the sidecar replies
+  // with status 304 and an empty body, so a revalidation costs the computation but not the payload.
+  string if_none_match = 5;
+}
+
+message CallResponse {
+  // HTTP status of the route (200, 304, 4xx, 5xx). Route errors are answers, not RPC failures.
+  uint32 status = 1;
+  // JSON response body; empty on 304.
+  bytes body = 2;
+  string content_type = 3;
+  // Freshness declared by the sidecar ("max-age=30, stale-while-revalidate=60", "no-store", ...).
+  string cache_control = 4;
+  // Weak validator of the body (W/"..."), present on 200 and 304.
+  string etag = 5;
+}
